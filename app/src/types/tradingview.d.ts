@@ -2,8 +2,8 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 interface TradingViewSubscription {
-  subscribe: (owner: unknown, callback: () => void) => void;
-  unsubscribe?: (owner: unknown, callback: () => void) => void;
+  subscribe: (owner: unknown, callback: (...args: any[]) => void) => void;
+  unsubscribe?: (owner: unknown, callback: (...args: any[]) => void) => void;
 }
 
 interface TradingViewChart {
@@ -12,6 +12,7 @@ interface TradingViewChart {
   setResolution: (resolution: string, callback?: () => void) => void;
   symbol: () => string;
   onSymbolChanged: () => TradingViewSubscription;
+  onIntervalChanged: () => TradingViewSubscription;
   createOrderLine: () => Promise<any>;
   createPositionLine: () => Promise<any>;
   /** 重新拉取图表 marks(交易历史) */

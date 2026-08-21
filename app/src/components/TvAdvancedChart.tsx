@@ -4,6 +4,8 @@ import type { TvDatafeed } from '@/lib/tvDatafeed';
 interface TvAdvancedChartProps {
   datafeed: TvDatafeed;
   symbol: string;
+  /** 初始周期(只在创建 widget 时生效;运行中切周期由图表自己管理) */
+  initialInterval: string;
   /** 初始主题;运行时切换由宿主调 widget.changeTheme,不重建图表 */
   theme: 'dark' | 'light';
   onWidgetReady?: (widget: TradingViewWidget) => void;
@@ -16,12 +18,14 @@ interface TvAdvancedChartProps {
 export default function TvAdvancedChart({
   datafeed,
   symbol,
+  initialInterval,
   theme,
   onWidgetReady,
 }: TvAdvancedChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const onWidgetReadyRef = useRef(onWidgetReady);
   onWidgetReadyRef.current = onWidgetReady;
+  const initialIntervalRef = useRef(initialInterval);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -33,7 +37,7 @@ export default function TvAdvancedChart({
       library_path: 'charting_library/',
       datafeed,
       symbol,
-      interval: '1',
+      interval: initialIntervalRef.current,
       locale: 'zh',
       theme,
       timezone: 'Asia/Shanghai',

@@ -22,12 +22,23 @@ const PANEL_WIDTH_KEY = 'nt8-terminal-panel-width';
 const THEME_KEY = 'nt8-terminal-theme';
 const SETTINGS_POS_KEY = 'nt8-terminal-settings-pos';
 const HIDDEN_ACCOUNTS_KEY = 'nt8-terminal-hidden-accounts';
+const SYMBOL_KEY = 'nt8-terminal-symbol';
+const INTERVAL_KEY = 'nt8-terminal-interval';
+const QTY_KEY = 'nt8-terminal-qty';
+const KIND_KEY = 'nt8-terminal-kind';
 
 export default function ChartTerminal() {
   const [datafeed] = useState(() => new TvDatafeed(createMockAdapter()));
   const [status, setStatus] = useState<FeedStatus>('connecting');
   const [nt8Info, setNt8Info] = useState<Nt8Status | null>(null);
-  const [defaultSymbol, setDefaultSymbol] = useState<string>('');
+  const [defaultSymbol, setDefaultSymbol] = useState<string>(() => {
+    // 界面缓存:恢复上次的合约(不在合约列表里时启动逻辑会回退到主力合约)
+    try { return localStorage.getItem(SYMBOL_KEY) || ''; } catch { return ''; }
+  });
+  /** 界面缓存:上次图表周期(只在创建 widget 时读取,切周期不重建图表) */
+  const [initialInterval] = useState(() => {
+    try { return localStorage.getItem(INTERVAL_KEY) || '1'; } catch { return '1'; }
+  });
   const [bridgeUrlDraft, setBridgeUrlDraft] = useState(getBridgeUrl());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [symbolsEmpty, setSymbolsEmpty] = useState(false);
@@ -70,8 +81,14 @@ export default function ChartTerminal() {
   // ---- 交易/草稿模式与票据状态(草稿线 hook 与面板共享) ----
   const [mode, setMode] = useState<'trade' | 'draft'>('trade');
   const [side, setSide] = useState<DraftSide>('BUY');
-  const [kind, setKind] = useState<OrderKind>('MKT');
-  const [qty, setQty] = useState(1);
+  const [kind, setKind] = useState<OrderKind>(() => {
+    // 界面缓存:恢复上次的单类型
+    try { return localStorage.getItem(KIND_KEY) === 'LMTSTP' ? 'LMTSTP' : 'MKT'; } catch { return 'MKT'; }
+  });
+  const [qty, setQty] = useState(() => {
+    // 界面缓存:恢复上次的手数
+    try { return Math.max(1, parseInt(localStorage.getItem(QTY_KEY) || '', 10) || 1); } catch { return 1; }
+  });
   const [limitPrice, setLimitPrice] = useState('');
   const [tpAmount, setTpAmount] = useState('');
   const [slAmount, setSlAmount] = useState('');
@@ -183,6 +200,11 @@ export default function ChartTerminal() {
       chart.onSymbolChanged().subscribe(null, () => {
         setChartSymbol(chart.symbol());
       });
+      // 界面缓存:周期变化即记忆,下次启动恢复
+      // (注意:本版库没有 chart.interval(),只能从事件参数取)
+      chart.onIntervalChanged().subscribe(null, (interval: string) => {
+        try { localStorage.setItem(INTERVAL_KEY, interval); } catch { /* ignore */ }
+      });
       // 默认指标:EMA20(图表上没有任何指标时才加,避免重复)
       try {
         const studies = (chart as any).getAllStudies ? (chart as any).getAllStudies() : [];
@@ -192,6 +214,17 @@ export default function ChartTerminal() {
       } catch { /* 指标加载失败不影响主流程 */ }
     });
   }, []);
+
+  // ---- 界面缓存:合约/单类型/手数 变化即写 localStorage ----
+  useEffect(() => {
+    if (chartSymbol) try { localStorage.setItem(SYMBOL_KEY, chartSymbol); } catch { /* ignore */ }
+  }, [chartSymbol]);
+  useEffect(() => {
+    try { localStorage.setItem(KIND_KEY, kind); } catch { /* ignore */ }
+  }, [kind]);
+  useEffect(() => {
+    try { localStorage.setItem(QTY_KEY, String(qty)); } catch { /* ignore */ }
+  }, [qty]);
 
   // ---- 主题应用:<html> 挂类切应用外壳变量;图表用 changeTheme 原地切换 ----
   useEffect(() => {
@@ -455,6 +488,7 @@ export default function ChartTerminal() {
           <TvAdvancedChart
             datafeed={datafeed}
             symbol={defaultSymbol}
+            initialInterval={initialInterval}
             theme={theme}
             onWidgetReady={handleWidgetReady}
           />
