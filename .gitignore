@@ -1,0 +1,14 @@
+# 依赖与构建产物
+node_modules/
+app/dist/
+
+# 本地编译/调试临时产物
+.build-check/
+.tmp-webbridge/
+
+# 第三方图表库源码副本(自带独立 .git 仓库,不进主仓库)
+charting_library-master/
+
+# 打包产物(pack.bat 可重新生成)
+NT8Terminal-package.zip
+NT8Terminal.exe
