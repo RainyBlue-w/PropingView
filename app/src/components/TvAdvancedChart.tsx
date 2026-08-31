@@ -49,6 +49,9 @@ export default function TvAdvancedChart({
       debug: false,
       // 开启右键菜单自定义项(onContextMenu 回调依赖此开关,否则注入的项不出现)
       enabled_features: ['custom_items_in_context_menu'],
+      // 禁用库内置合约搜索(顶栏按钮 + 键盘快搜),统一用自建的收藏搜索栏,
+      // 避免两套搜索候选不一致(库内搜索无星标置顶)
+      disabled_features: ['header_symbol_search', 'symbol_search_hot_key'],
     });
 
     onWidgetReadyRef.current?.(widget);

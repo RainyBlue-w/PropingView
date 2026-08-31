@@ -42,20 +42,6 @@ namespace NinjaTrader.NinjaScript.AddOns
     {
         // ===== 可按需修改的配置 =====
         private const int Port = 8090;
-
-        // 自选股列表(NT8 合约名)。改成你实际订阅行情的合约。
-        // 注意合约到期月:到期后这里需要换成新的主力合约(前端图表里也可直接输入任意合约名)。
-        private static readonly string[] Watchlist =
-        {
-            "ES 09-26",   // E-mini 标普500
-            "MES 09-26",  // 微型标普500
-            "NQ 09-26",   // E-mini 纳指100
-            "MNQ 09-26",  // 微型纳指100
-            "GC 12-26",   // 黄金
-            "MGC 12-26",  // 微型黄金
-            "CL 10-26",   // WTI 原油(月度合约,注意换月)
-            "6E 09-26",   // 欧元外汇期货
-        };
         // ============================
 
         private TcpListener listener;
@@ -82,6 +68,79 @@ namespace NinjaTrader.NinjaScript.AddOns
         // 会永久抬高地平线,之后所有新会话都被钳到幻影桶上
         private static readonly ConcurrentDictionary<string, long> historyFloor =
             new ConcurrentDictionary<string, long>();
+
+        // NT8 内置仿真账户:没有独立连接(或连接状态不反映"在线"),始终保留在账户列表里
+        private static readonly HashSet<string> BuiltinAccounts =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Sim101", "Backtest", "Playback101" };
+
+        // ===== 账户数据订阅(实盘/PROP 账户持仓为空问题的修复) =====
+        // NT8 对外部连接账户是懒加载的:没有代码订阅其数据流时,acc.Positions/acc.Orders
+        // 一直返回空集合;Sim101 等内置账户由核心常驻跟踪,所以看起来"只有仿真账户正常"。
+        // 为每个账户挂四个更新事件的常驻 handler 即迫使 NT8 开始跟踪该账户;
+        // 同时用 PositionUpdate 事件维护持仓缓存,作为 Positions 集合仍为空时的兜底。
+        private readonly object subscribeLock = new object();
+        private readonly HashSet<string> subscribedAccounts =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private class CachedPosition
+        {
+            public int Quantity;        // 带符号:多正空负
+            public double AveragePrice;
+            public string MarketPosition;
+        }
+        // key = accountName|instrumentFullName
+        private readonly Dictionary<string, CachedPosition> positionCache =
+            new Dictionary<string, CachedPosition>();
+
+        private void EnsureSubscribed(Account acc)
+        {
+            if (acc == null) return;
+            lock (subscribeLock)
+            {
+                if (subscribedAccounts.Contains(acc.Name)) return;
+                subscribedAccounts.Add(acc.Name);
+            }
+            try
+            {
+                acc.PositionUpdate += OnAccountPositionUpdate;
+                acc.OrderUpdate += OnAccountOrderNoop;
+                acc.ExecutionUpdate += OnAccountExecutionNoop;
+                acc.AccountItemUpdate += OnAccountItemNoop;
+                NinjaTrader.Code.Output.Process("TvBridgeAddOn 已订阅账户数据: " + acc.Name, PrintTo.OutputTab1);
+            }
+            catch (Exception ex)
+            {
+                NinjaTrader.Code.Output.Process("TvBridgeAddOn 订阅账户失败(" + acc.Name + "): " + ex.Message, PrintTo.OutputTab1);
+            }
+        }
+
+        private void OnAccountPositionUpdate(object sender, PositionEventArgs e)
+        {
+            try
+            {
+                var acc = sender as Account;
+                if (acc == null || e.Position == null || e.Position.Instrument == null) return;
+                string key = acc.Name + "|" + e.Position.Instrument.FullName;
+                lock (positionCache)
+                {
+                    if (e.MarketPosition == MarketPosition.Flat)
+                        positionCache.Remove(key);
+                    else
+                        positionCache[key] = new CachedPosition
+                        {
+                            Quantity = e.MarketPosition == MarketPosition.Long ? e.Quantity : -e.Quantity,
+                            AveragePrice = e.AveragePrice,
+                            MarketPosition = e.MarketPosition.ToString(),
+                        };
+                }
+            }
+            catch { }
+        }
+
+        // 这三个事件只用于"激活"NT8 对该账户的跟踪,不需要处理内容
+        private void OnAccountOrderNoop(object sender, OrderEventArgs e) { }
+        private void OnAccountExecutionNoop(object sender, ExecutionEventArgs e) { }
+        private void OnAccountItemNoop(object sender, AccountItemEventArgs e) { }
 
         private static long HistoryFloor(string instrFullName, int intervalSec)
         {
@@ -114,6 +173,21 @@ namespace NinjaTrader.NinjaScript.AddOns
             else if (State == State.Terminated)
             {
                 StopServer();
+                // 退订账户数据流,避免 NT8 侧挂着悬空调用
+                Account[] all;
+                lock (Account.All) all = Account.All.ToArray();
+                foreach (var acc in all)
+                {
+                    try
+                    {
+                        acc.PositionUpdate -= OnAccountPositionUpdate;
+                        acc.OrderUpdate -= OnAccountOrderNoop;
+                        acc.ExecutionUpdate -= OnAccountExecutionNoop;
+                        acc.AccountItemUpdate -= OnAccountItemNoop;
+                    }
+                    catch { }
+                }
+                lock (subscribeLock) subscribedAccounts.Clear();
             }
         }
 
@@ -201,6 +275,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                         case "/api/history": HandleHistory(ns, q); break;
                         // ---- 交易接口 ----
                         case "/api/accounts":  HandleAccounts(ns);   break;
+                        case "/api/debug":     HandleDebug(ns);     break;
                         case "/api/positions": HandlePositions(ns, q); break;
                         case "/api/orders":    HandleOrders(ns, q);  break;
                         case "/api/brackets":  HandleBrackets(ns, q); break;
@@ -318,14 +393,34 @@ namespace NinjaTrader.NinjaScript.AddOns
             WriteJson(ns, 200, json);
         }
 
+        // 候选合约列表:直接读 NT8 合约库(Instrument.All),不用预设字符串。
+        // 跳过已到期合约,按全名排序;前端图表/订单/持仓统一以 NT8 FullName 为准
         private void HandleSymbols(NetworkStream ns)
         {
+            Instrument[] all;
+            lock (Instrument.All) all = Instrument.All.ToArray();
+            var names = new List<string>();
+            foreach (var instr in all)
+            {
+                if (instr == null || instr.MasterInstrument == null) continue;
+                try
+                {
+                    // 已到期合约不下发(股票等无到期日的 Expiry 为 MinDate,不受影响)
+                    if (instr.Expiry > Core.Globals.MinDate && instr.Expiry < DateTime.Now) continue;
+                }
+                catch { }
+                names.Add(instr.FullName);
+            }
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+
             var sb = new StringBuilder("{\"symbols\":[");
             bool first = true;
-            foreach (string name in Watchlist)
+            foreach (string name in names)
             {
-                string entry = BuildSymbolJson(name);
-                if (entry == null) continue;   // NT8 中不存在的合约跳过
+                Instrument instr = null;
+                try { instr = Instrument.GetInstrument(name); } catch { }
+                string entry = BuildSymbolJson(instr);
+                if (entry == null) continue;
                 if (!first) sb.Append(',');
                 first = false;
                 sb.Append(entry);
@@ -334,27 +429,28 @@ namespace NinjaTrader.NinjaScript.AddOns
             WriteJson(ns, 200, sb.ToString());
         }
 
-        // 按名称解析任意 NT8 合约,供前端搜索框直接输入的合约使用(无需改 Watchlist)
+        // 按名称解析任意 NT8 合约,供前端搜索框直接输入的合约使用
+        // 返回的 symbol 一律是 NT8 FullName(如 "NQ SEP26"),前端直接采用,不做名称转换
         private void HandleResolve(NetworkStream ns, Dictionary<string, string> q)
         {
             string symbol;
             if (!q.TryGetValue("symbol", out symbol) || string.IsNullOrWhiteSpace(symbol))
             { WriteJson(ns, 400, "{\"error\":\"missing symbol\"}"); return; }
 
-            string entry = BuildSymbolJson(symbol);
+            Instrument instr = null;
+            try { instr = Instrument.GetInstrument(symbol); } catch { }
+            string entry = BuildSymbolJson(instr);
             if (entry == null) { WriteJson(ns, 404, "{\"error\":\"unknown symbol\"}"); return; }
             WriteJson(ns, 200, entry);
         }
 
-        private static string BuildSymbolJson(string name)
+        private static string BuildSymbolJson(Instrument instr)
         {
-            Instrument instr = null;
-            try { instr = Instrument.GetInstrument(name); } catch { }
             if (instr == null) return null;
 
             double tick = 0.01;
             double pointValue = 1;
-            string desc = name;
+            string desc = instr.FullName;
             string type = "futures";
             try
             {
@@ -366,7 +462,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             catch { }
 
-            return "{\"symbol\":" + JsonQuote(name)
+            return "{\"symbol\":" + JsonQuote(instr.FullName)
                  + ",\"name\":" + JsonQuote(desc)
                  + ",\"tickSize\":" + tick.ToString("R", CultureInfo.InvariantCulture)
                  + ",\"pointValue\":" + pointValue.ToString("R", CultureInfo.InvariantCulture)
@@ -687,10 +783,14 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         // ---------------- 交易接口 ----------------
 
-        private static Account FindAccount(string name)
+        private Account FindAccount(string name)
         {
+            Account acc;
             lock (Account.All)
-                return Account.All.FirstOrDefault(a => a.Name == name);
+                acc = Account.All.FirstOrDefault(a => a.Name == name);
+            // 找到即订阅:外部连接账户未订阅时 Positions/Orders 恒为空
+            if (acc != null) EnsureSubscribed(acc);
+            return acc;
         }
 
         private static bool IsWorkingState(OrderState s)
@@ -713,10 +813,20 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             Account[] accounts;
             lock (Account.All) accounts = Account.All.ToArray();
+            // 只下发"活"账户:连接处于 Connected,或 NT8 内置仿真账户。
+            // Account.All 会残留已关闭/已断开连接的账户,不下发,避免面板账户列表越积越多
+            accounts = accounts.Where(acc =>
+            {
+                if (BuiltinAccounts.Contains(acc.Name)) return true;
+                try { return acc.Connection != null && acc.Connection.Status == ConnectionStatus.Connected; }
+                catch { return false; }
+            }).ToArray();
             var sb = new StringBuilder("{\"accounts\":[");
             bool first = true;
             foreach (var acc in accounts)
             {
+                // 列表下发即订阅,持仓/订单数据流随即激活
+                EnsureSubscribed(acc);
                 string conn = string.Empty;
                 try
                 {
@@ -764,6 +874,80 @@ namespace NinjaTrader.NinjaScript.AddOns
             WriteJson(ns, 200, sb.ToString());
         }
 
+        // GET /api/debug -> 自助排障:列出全部账户及其连接状态/持仓数/订单数/读取异常。
+        // 迁移部署后持仓不显示时,让对方浏览器直接打开 http://127.0.0.1:8090/api/debug 看原始状态
+        private void HandleDebug(NetworkStream ns)
+        {
+            Account[] all;
+            lock (Account.All) all = Account.All.ToArray();
+
+            var sb = new StringBuilder();
+            sb.Append("{\"ntTime\":").Append(JsonQuote(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")))
+              .Append(",\"connections\":[");
+            bool first = true;
+            try
+            {
+                if (Connection.Connections != null)
+                    foreach (var c in Connection.Connections)
+                    {
+                        if (!first) sb.Append(',');
+                        first = false;
+                        string cname = "";
+                        try { if (c.Options != null) cname = c.Options.Name; } catch { }
+                        sb.Append("{\"name\":").Append(JsonQuote(cname))
+                          .Append(",\"status\":").Append(JsonQuote(c.Status.ToString()))
+                          .Append("}");
+                    }
+            }
+            catch { }
+            sb.Append("],\"accounts\":[");
+            first = true;
+            foreach (var acc in all)
+            {
+                string conn = "", connStatus = "", posErr = "", ordErr = "";
+                int posTotal = -1, posOpen = -1, ordTotal = -1, ordWorking = -1;
+                try
+                {
+                    if (acc.Connection != null)
+                    {
+                        if (acc.Connection.Options != null) conn = acc.Connection.Options.Name;
+                        connStatus = acc.Connection.Status.ToString();
+                    }
+                }
+                catch { }
+                try
+                {
+                    Position[] ps = acc.Positions.ToArray();
+                    posTotal = ps.Length;
+                    posOpen = ps.Count(p => p != null && p.MarketPosition != MarketPosition.Flat);
+                }
+                catch (Exception ex) { posErr = ex.Message; }
+                try
+                {
+                    Order[] os = acc.Orders.ToArray();
+                    ordTotal = os.Length;
+                    ordWorking = os.Count(o => o != null && IsWorkingState(o.OrderState));
+                }
+                catch (Exception ex) { ordErr = ex.Message; }
+
+                if (!first) sb.Append(',');
+                first = false;
+                sb.Append("{\"name\":").Append(JsonQuote(acc.Name))
+                  .Append(",\"connection\":").Append(JsonQuote(conn))
+                  .Append(",\"connectionStatus\":").Append(JsonQuote(connStatus))
+                  .Append(",\"builtin\":").Append(BuiltinAccounts.Contains(acc.Name) ? "true" : "false")
+                  .Append(",\"positionsTotal\":").Append(posTotal)
+                  .Append(",\"positionsOpen\":").Append(posOpen)
+                  .Append(",\"ordersTotal\":").Append(ordTotal)
+                  .Append(",\"ordersWorking\":").Append(ordWorking);
+                if (posErr.Length > 0) sb.Append(",\"positionsError\":").Append(JsonQuote(posErr));
+                if (ordErr.Length > 0) sb.Append(",\"ordersError\":").Append(JsonQuote(ordErr));
+                sb.Append("}");
+            }
+            sb.Append("]}");
+            WriteJson(ns, 200, sb.ToString());
+        }
+
         private void HandlePositions(NetworkStream ns, Dictionary<string, string> q)
         {
             string accName;
@@ -772,21 +956,47 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (acc == null) { WriteJson(ns, 404, "{\"error\":\"unknown account\"}"); return; }
 
             Position[] snapshot;
-            try { snapshot = acc.Positions.ToArray(); } catch { snapshot = new Position[0]; }
+            try { snapshot = acc.Positions.ToArray(); }
+            catch (Exception ex)
+            {
+                snapshot = new Position[0];
+                NinjaTrader.Code.Output.Process(
+                    "TvBridgeAddOn 读取持仓失败(" + accName + "): " + ex.Message, PrintTo.OutputTab1);
+            }
 
             var sb = new StringBuilder("{\"positions\":[");
             bool first = true;
+            var emitted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var p in snapshot)
             {
                 if (p.MarketPosition == MarketPosition.Flat) continue;
                 long signed = p.MarketPosition == MarketPosition.Long ? p.Quantity : -p.Quantity;
                 if (!first) sb.Append(',');
                 first = false;
+                emitted.Add(p.Instrument.FullName);
                 sb.Append("{\"instrument\":").Append(JsonQuote(p.Instrument.FullName))
                   .Append(",\"quantity\":").Append(signed.ToString(CultureInfo.InvariantCulture))
                   .Append(",\"averagePrice\":").Append(F(p.AveragePrice))
                   .Append(",\"marketPosition\":").Append(JsonQuote(p.MarketPosition.ToString()))
                   .Append("}");
+            }
+            // 兜底:订阅后由 PositionUpdate 事件维护的缓存(Positions 集合仍为空时救命)
+            lock (positionCache)
+            {
+                string prefix = acc.Name + "|";
+                foreach (var kv in positionCache)
+                {
+                    if (!kv.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                    string instrName = kv.Key.Substring(prefix.Length);
+                    if (emitted.Contains(instrName)) continue;
+                    if (!first) sb.Append(',');
+                    first = false;
+                    sb.Append("{\"instrument\":").Append(JsonQuote(instrName))
+                      .Append(",\"quantity\":").Append(kv.Value.Quantity.ToString(CultureInfo.InvariantCulture))
+                      .Append(",\"averagePrice\":").Append(F(kv.Value.AveragePrice))
+                      .Append(",\"marketPosition\":").Append(JsonQuote(kv.Value.MarketPosition ?? ""))
+                      .Append("}");
+                }
             }
             sb.Append("]}");
             WriteJson(ns, 200, sb.ToString());
@@ -800,7 +1010,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (acc == null) { WriteJson(ns, 404, "{\"error\":\"unknown account\"}"); return; }
 
             Order[] snapshot;
-            try { snapshot = acc.Orders.ToArray(); } catch { snapshot = new Order[0]; }
+            try { snapshot = acc.Orders.ToArray(); }
+            catch (Exception ex)
+            {
+                snapshot = new Order[0];
+                NinjaTrader.Code.Output.Process(
+                    "TvBridgeAddOn 读取订单失败(" + accName + "): " + ex.Message, PrintTo.OutputTab1);
+            }
 
             DateTime cutoff = DateTime.Now.AddHours(-6);
             var list = snapshot
@@ -929,7 +1145,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         // POST {account, symbol, action:BUY|SELL, orderType:MARKET|LIMIT|STOPMARKET|STOPLIMIT,
-        //       quantity, limitPrice, stopPrice, tif:DAY|GTC, tp(止盈价,可选), sl(止损价,可选)}
+        //       quantity, limitPrice, stopPrice, tif:DAY|GTC,
+        //       tp/sl(止盈/止损绝对价,可选),
+        //       tpAmount/slAmount(止盈/止损金额$,可选,市价单用——成交后按实际均价换算目标价)}
         private void HandlePlaceOrder(NetworkStream ns, string body)
         {
             var d = ParseFlatJson(body);
@@ -958,6 +1176,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             double stopPrice = ParseDouble(Get(d, "stopPrice"), 0);
             double tp = ParseDouble(Get(d, "tp"), 0);
             double sl = ParseDouble(Get(d, "sl"), 0);
+            // 金额模式(草稿市价单):成交价未知,成交后按实际均价换算止盈/止损价
+            double tpAmount = ParseDouble(Get(d, "tpAmount"), 0);
+            double slAmount = ParseDouble(Get(d, "slAmount"), 0);
             TimeInForce tif = Get(d, "tif").ToUpperInvariant() == "DAY" ? TimeInForce.Day : TimeInForce.Gtc;
 
             if ((ot == OrderType.Limit || ot == OrderType.StopLimit) && limitPrice <= 0)
@@ -969,16 +1190,19 @@ namespace NinjaTrader.NinjaScript.AddOns
                 limitPrice, stopPrice, string.Empty, "TV Entry", Core.Globals.MaxDate, null);
             if (entry == null) { WriteJson(ns, 500, "{\"error\":\"CreateOrder failed\"}"); return; }
 
-            // 有止盈/止损价时,等入场单完全成交后自动挂 OCO 括号单
-            if (tp > 0 || sl > 0) RegisterBracketOnFill(acc, instr, oa, qty, tp, sl, entry, tif);
+            // 有止盈/止损价(或金额)时,等入场单完全成交后自动挂 OCO 括号单
+            if (tp > 0 || sl > 0 || tpAmount > 0 || slAmount > 0)
+                RegisterBracketOnFill(acc, instr, oa, qty, tp, sl, tpAmount, slAmount, entry, tif);
 
             acc.Submit(new[] { entry });
             WriteJson(ns, 200, "{\"ok\":true,\"orderId\":" + JsonQuote(entry.OrderId ?? "") + "}");
         }
 
-        // 入场单成交后自动挂 OCO 止盈(限价)+ 止损(市价止损)
+        // 入场单成交后自动挂 OCO 止盈(限价)+ 止损(市价止损)。
+        // tp/sl 为绝对价(LMT/STP 场景);tpAmount/slAmount 为美元金额(MKT 场景),
+        // 金额模式在成交瞬间取实际成交均价换算目标价,保证金额风险不受滑点影响
         private void RegisterBracketOnFill(Account acc, Instrument instr, OrderAction entryAction,
-            int qty, double tp, double sl, Order entry, TimeInForce tif)
+            int qty, double tp, double sl, double tpAmount, double slAmount, Order entry, TimeInForce tif)
         {
             // 注册待触发括号单,供 /api/brackets 查询(入场单成交前止盈止损价只存在这里)
             lock (bracketLock)
@@ -1004,19 +1228,47 @@ namespace NinjaTrader.NinjaScript.AddOns
 
                     int filledQty = e.Execution.Order.Filled > 0 ? e.Execution.Order.Filled : qty;
                     OrderAction exit = entryAction == OrderAction.Buy ? OrderAction.Sell : OrderAction.Buy;
+
+                    // 金额模式:按实际成交均价换算止盈/止损价(与前端 draftCalc.amountToPrice 同公式)
+                    double tpPrice = tp, slPrice = sl;
+                    if (tpAmount > 0 || slAmount > 0)
+                    {
+                        double fill = 0, tickSize = 0.01, pointValue = 1;
+                        try { fill = e.Execution.Order.AverageFillPrice; } catch { }
+                        try
+                        {
+                            tickSize = instr.MasterInstrument.TickSize;
+                            pointValue = instr.MasterInstrument.PointValue;
+                        }
+                        catch { }
+                        if (fill > 0 && pointValue > 0 && tickSize > 0)
+                        {
+                            int dir = entryAction == OrderAction.Buy ? 1 : -1;
+                            if (tpAmount > 0)
+                                tpPrice = instr.MasterInstrument.RoundToTickSize(
+                                    fill + dir * (tpAmount / (tickSize * pointValue * filledQty)) * tickSize);
+                            if (slAmount > 0)
+                                slPrice = instr.MasterInstrument.RoundToTickSize(
+                                    fill - dir * (slAmount / (tickSize * pointValue * filledQty)) * tickSize);
+                            NinjaTrader.Code.Output.Process(string.Format(
+                                "TvBridge 金额括号: fill={0} tpAmount={1}->{2} slAmount={3}->{4}",
+                                fill, tpAmount, tpPrice, slAmount, slPrice), PrintTo.OutputTab1);
+                        }
+                    }
+
                     string oco = "tv" + DateTime.Now.ToString("HHmmssfff");
                     var bracket = new List<Order>();
 
-                    if (tp > 0)
+                    if (tpPrice > 0)
                     {
                         Order tpOrder = acc.CreateOrder(instr, exit, OrderType.Limit, OrderEntry.Manual,
-                            tif, filledQty, tp, 0, oco, "TV TP", Core.Globals.MaxDate, null);
+                            tif, filledQty, tpPrice, 0, oco, "TV TP", Core.Globals.MaxDate, null);
                         if (tpOrder != null) bracket.Add(tpOrder);
                     }
-                    if (sl > 0)
+                    if (slPrice > 0)
                     {
                         Order slOrder = acc.CreateOrder(instr, exit, OrderType.StopMarket, OrderEntry.Manual,
-                            tif, filledQty, 0, sl, oco, "TV SL", Core.Globals.MaxDate, null);
+                            tif, filledQty, 0, slPrice, oco, "TV SL", Core.Globals.MaxDate, null);
                         if (slOrder != null) bracket.Add(slOrder);
                     }
                     if (bracket.Count > 0) acc.Submit(bracket.ToArray());

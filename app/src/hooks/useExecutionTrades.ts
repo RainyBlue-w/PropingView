@@ -1,6 +1,8 @@
 import { useEffect, useRef } from 'react';
-import { nt8Trading, type Nt8Execution } from '@/lib/nt8Trading';
+import { type Nt8Execution } from '@/lib/nt8Trading';
+import { trading } from '@/lib/tradingRouter';
 import { pairRoundTrips } from '@/lib/executionPairs';
+import { ensureExecutionToolPatched } from '@/lib/tvExecutionTool';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -21,8 +23,42 @@ interface UseExecutionTradesParams {
 const LOOKBACK_SEC = 7 * 86400;
 
 /**
+ * 私有路径:创建 LineToolExecution 成交小三角并配置属性。
+ * 返回值是图表实体 id(与公开 createMultipointShape 同域,removeEntity 可删)。
+ * 任何一步失败抛异常,由调用方回退到公开箭头。
+ */
+function createExecTriangle(chart: any, e: Nt8Execution, isBuy: boolean): any {
+  const cw = chart._chartWidget;
+  const model = cw?._model ?? cw?.model?.();
+  if (!model) throw new Error('no chart model');
+  const pane = model.paneForSource(model.mainSeries());
+  const pts = chart._convertUserPointsToDataSource([{ time: e.time, price: e.price }]);
+  const point = pts?.[0];
+  if (!pane || !point) throw new Error('point convert failed');
+  const src = model.createLineTool({ pane, point, linetool: 'LineToolExecution' });
+  if (!src) throw new Error('createLineTool returned null');
+  const color = isBuy ? '#26a69a' : '#ef5350';
+  const p = typeof src.properties === 'function' ? src.properties() : null;
+  if (p) {
+    p.direction?.setValue?.(isBuy ? 'buy' : 'sell');
+    p.text?.setValue?.(`${isBuy ? 'BUY' : 'SELL'} ${e.qty} @${e.price}`);
+    p.tooltip?.setValue?.(
+      `${isBuy ? 'Buy' : 'Sell'} ${e.qty} @ ${e.price}\n${new Date(e.time * 1000).toLocaleString()}\norderId: ${e.orderId}`,
+    );
+    p.arrowBuyColor?.setValue?.('#26a69a');
+    p.arrowSellColor?.setValue?.('#ef5350');
+    p.textColor?.setValue?.(color);
+    p.frozen?.setValue?.(true); // 锁定,防误拖
+  }
+  src.setSavingInChartEnabled?.(false); // 与公开路径 disableSave 对齐:不参与布局保存
+  return src.id();
+}
+
+/**
  * 图表交易历史(交易平台风格):
- * - 成交点:arrow_up/down 箭头(买绿卖红),尖端精确对准成交时间/价;
+ * - 成交点:优先用 LineToolExecution 小三角(官网同款,y 经补丁精确锚定成交价,
+ *   附带文字与 tooltip;引导见 lib/tvExecutionTool.ts),私有 API 不可用时回退
+ *   arrow_up/down 公开箭头(买绿卖红,尖端同样精确对准成交时间/价);
  * - FIFO 配对进出场,画虚线连线并标注盈亏金额(盈绿亏红);
  * - 所有图形 zOrder 顶层、锁定不可拖、不参与保存。
  * 数据来自 /api/executions(NT8 本地库,默认永久保存)。
@@ -79,7 +115,7 @@ export function useExecutionTrades({
       let executions: Nt8Execution[];
       try {
         const to = Math.floor(Date.now() / 1000);
-        ({ executions } = await nt8Trading.getExecutions(account, symbol, to - LOOKBACK_SEC, to));
+        ({ executions } = await trading.getExecutions(account, symbol, to - LOOKBACK_SEC, to));
       } catch {
         return;   // 拉取失败保留已有图形,下次签名变化重试
       }
@@ -87,23 +123,33 @@ export function useExecutionTrades({
 
       const seen = new Set<string>();
 
-      // ---- 成交点箭头(arrow_up/down:箭头尖端精确对准成交时间/价) ----
-      // 注:该线型尺寸固定(约 20px,库未暴露尺寸覆写),但锚点精确;
-      // 颜色键是 arrowColor(color 控制的是附带文本)
+      // ---- 成交点标记 ----
+      // 首选(私有 API):LineToolExecution 小三角,精确价格锚定 + 文字/tooltip;
+      // 回退(公开 API):arrow_up/down 粗箭头,尖端精确但尺寸固定约 20px
+      // (库未暴露尺寸覆写;颜色键是 arrowColor,color 控制的是附带文本)
+      const execToolReady = await ensureExecutionToolPatched(widget);
+      if (cancelled) return;
       for (const e of executions) {
         const key = `exec-${e.orderId}-${e.time}-${e.side}-${e.qty}`;
         seen.add(key);
         const isBuy = e.side === 'Buy';
-        addShape(key, () =>
-          chart.createMultipointShape([{ time: e.time, price: e.price }], {
+        addShape(key, async () => {
+          if (execToolReady) {
+            try {
+              return createExecTriangle(chart, e, isBuy);
+            } catch {
+              /* 私有路径失败,落公开箭头 */
+            }
+          }
+          return chart.createMultipointShape([{ time: e.time, price: e.price }], {
             shape: isBuy ? 'arrow_up' : 'arrow_down',
             lock: true,
             disableSelection: true,
             disableSave: true,
             zOrder: 'top',
             overrides: { arrowColor: isBuy ? '#26a69a' : '#ef5350' },
-          }),
-        );
+          });
+        });
       }
 
       // ---- FIFO 配对:进出场盈亏连线 ----

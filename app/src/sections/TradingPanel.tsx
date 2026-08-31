@@ -1,20 +1,13 @@
-import { useState } from 'react';
-import { AlertCircle, CheckCircle2, Eye, EyeOff, Loader2, X } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { AlertCircle, CheckCircle2, ChevronDown, ChevronRight, Eye, EyeOff, Loader2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
-import {
-  nt8Trading,
   type Nt8Account,
   type Nt8Order,
   type Nt8Position,
 } from '@/lib/nt8Trading';
+import { trading } from '@/lib/tradingRouter';
 import { amountToPrice, detectOrderType, type DraftSide } from '@/lib/draftCalc';
 
 interface TradingPanelProps {
@@ -30,6 +23,8 @@ interface TradingPanelProps {
   onToggleHidden: (name: string) => void;
   positions: Nt8Position[];
   orders: Nt8Order[];
+  /** 持仓/订单轮询错误(null=正常);面板顶部红条提示 */
+  pollError: string | null;
   onChanged: () => void;
   // ---- 交易/草稿模式与票据状态(提升自 ChartTerminal,草稿线需要共享) ----
   mode: 'trade' | 'draft';
@@ -81,6 +76,30 @@ function tickDecimals(tick: number): number {
   return d;
 }
 
+/** 按 Connection 分组(保持首现顺序);无连接的归入"其他" */
+interface AccountGroup {
+  connection: string;
+  items: Nt8Account[];
+}
+function groupByConnection(list: Nt8Account[]): AccountGroup[] {
+  const groups: AccountGroup[] = [];
+  const idx = new Map<string, AccountGroup>();
+  for (const a of list) {
+    const key = a.connection ? a.connection : '其他';
+    let g = idx.get(key);
+    if (!g) {
+      g = { connection: key, items: [] };
+      idx.set(key, g);
+      groups.push(g);
+    }
+    g.items.push(a);
+  }
+  return groups;
+}
+
+/** 折叠组名持久化 key */
+const COLLAPSED_KEY = 'tv-collapsed-conn-groups';
+
 export default function TradingPanel({
   enabled,
   symbol,
@@ -92,6 +111,7 @@ export default function TradingPanel({
   onToggleHidden,
   positions,
   orders,
+  pollError,
   onChanged,
   mode,
   onModeChange,
@@ -118,6 +138,37 @@ export default function TradingPanel({
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
   /** 面板页签:交易 | 账户信息 */
   const [page, setPage] = useState<'trade' | 'accounts'>('trade');
+  /** 账户下拉(自绘,支持 Connection 分组折叠) */
+  const [ddOpen, setDdOpen] = useState(false);
+  const ddRef = useRef<HTMLDivElement>(null);
+  /** Connection 分组折叠状态(localStorage 持久化,账户页/下拉共用) */
+  const [collapsed, setCollapsed] = useState<string[]>(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(COLLAPSED_KEY) || '[]');
+      return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
+    } catch {
+      return [];
+    }
+  });
+  const toggleGroup = (name: string) => {
+    setCollapsed((prev) => {
+      const next = prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name];
+      try {
+        localStorage.setItem(COLLAPSED_KEY, JSON.stringify(next));
+      } catch {
+        /* 存储不可用时仅本次会话生效 */
+      }
+      return next;
+    });
+  };
+  useEffect(() => {
+    if (!ddOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ddRef.current && !ddRef.current.contains(e.target as Node)) setDdOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [ddOpen]);
 
   const workingOrders = orders.filter(
     (o) => WORKING_STATES.has(o.state) && o.instrument === symbol,
@@ -174,17 +225,22 @@ export default function TradingPanel({
       if (orderType === 'LIMIT') lp = p;
       else sp = p;
     }
-    // 草稿模式:止盈止损来自金额换算(与图上虚线位置一致);交易模式:直接读价格输入
+    // 草稿模式:止盈止损来自金额换算(与图上虚线位置一致);交易模式:直接读价格输入。
+    // 市价单成交价未知,发金额由桥在成交后按实际均价换算;LMT/STP 入场价已知,直接发绝对价
     let tp: number | undefined;
     let sl: number | undefined;
+    let tpA = NaN;
+    let slA = NaN;
     if (mode === 'draft') {
-      const tpA = parseFloat(tpAmount);
-      const slA = parseFloat(slAmount);
-      if (refPrice && tpA > 0) {
-        tp = amountToPrice(clicked, true, tpA, refPrice, tickSize, pointValue, qty) ?? undefined;
-      }
-      if (refPrice && slA > 0) {
-        sl = amountToPrice(clicked, false, slA, refPrice, tickSize, pointValue, qty) ?? undefined;
+      tpA = parseFloat(tpAmount);
+      slA = parseFloat(slAmount);
+      if (kind === 'LMTSTP') {
+        if (refPrice && tpA > 0) {
+          tp = amountToPrice(clicked, true, tpA, refPrice, tickSize, pointValue, qty) ?? undefined;
+        }
+        if (refPrice && slA > 0) {
+          sl = amountToPrice(clicked, false, slA, refPrice, tickSize, pointValue, qty) ?? undefined;
+        }
       }
     } else {
       tp = tpPrice ? roundToTick(parseFloat(tpPrice), tickSize) : undefined;
@@ -193,7 +249,7 @@ export default function TradingPanel({
     setBusy(true);
     setMessage(null);
     try {
-      await nt8Trading.placeOrder({
+      await trading.placeOrder({
         account,
         symbol,
         action: clicked,
@@ -203,14 +259,21 @@ export default function TradingPanel({
         stopPrice: sp,
         tp,
         sl,
+        tpAmount: mode === 'draft' && kind === 'MKT' && tpA > 0 ? tpA : undefined,
+        slAmount: mode === 'draft' && kind === 'MKT' && slA > 0 ? slA : undefined,
       });
+      const mktAmt =
+        mode === 'draft' && kind === 'MKT' && (tpA > 0 || slA > 0)
+          ? `${tpA > 0 ? ` · 止盈 $${tpA}` : ''}${slA > 0 ? ` · 止损 $${slA}` : ''}(按实际成交价定位)`
+          : '';
       setMessage({
         ok: true,
         text:
           `${orderType === 'LIMIT' ? '限价单' : orderType === 'STOPMARKET' ? '止损单' : '市价单'}已提交` +
-          (mode === 'draft' && (tp || sl)
-            ? `${tp ? ` · 止盈 ${tp.toFixed(decimals)}` : ''}${sl ? ` · 止损 ${sl.toFixed(decimals)}` : ''}`
-            : ''),
+          (mktAmt ||
+            (mode === 'draft' && (tp || sl)
+              ? `${tp ? ` · 止盈 ${tp.toFixed(decimals)}` : ''}${sl ? ` · 止损 ${sl.toFixed(decimals)}` : ''}`
+              : '')),
       });
       if (mode === 'draft') {
         // 草稿提交后由真实订单线接管:清掉草稿金额与入场价,所有草稿虚线随之消失
@@ -228,7 +291,7 @@ export default function TradingPanel({
 
   const cancelOrder = async (orderId: string) => {
     try {
-      await nt8Trading.cancelOrder(account, orderId);
+      await trading.cancelOrder(account, orderId);
       onChanged();
     } catch (err) {
       setMessage({ ok: false, text: err instanceof Error ? err.message : '撤单失败' });
@@ -239,7 +302,7 @@ export default function TradingPanel({
     if (!position) return;
     setBusy(true);
     try {
-      await nt8Trading.closePosition(account, symbol);
+      await trading.closePosition(account, symbol);
       setMessage({ ok: true, text: '平仓单已提交' });
       onChanged();
     } catch (err) {
@@ -260,6 +323,91 @@ export default function TradingPanel({
       : `${v < 0 ? '-' : ''}$${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   const pnlCls = (v?: number): string =>
     v == null ? 'text-[var(--tv-muted)]' : v >= 0 ? 'text-[#26a69a]' : 'text-[#ef5350]';
+
+  /** 账户页单个账户卡片 */
+  const renderAccountCard = (a: Nt8Account) => {
+    const isActive = a.name === account;
+    const isHidden = hiddenAccounts.includes(a.name);
+    const hasFin = a.netLiquidation != null || a.cashValue != null;
+    return (
+      <div
+        key={a.name}
+        onClick={() => { if (!isHidden) onAccountChange(a.name); }}
+        className={`w-full rounded border p-2.5 text-left transition-colors ${
+          isHidden
+            ? 'cursor-default border-[var(--tv-border)] bg-[var(--tv-bg)] opacity-40 grayscale'
+            : isActive
+              ? 'cursor-pointer border-[#2962ff] bg-[#2962ff]/10'
+              : 'cursor-pointer border-[var(--tv-border)] bg-[var(--tv-bg)] hover:border-[#2962ff]/50'
+        }`}
+        title={isHidden ? '已隐藏(点眼睛恢复)' : isActive ? '当前账户' : '点击切换为该账户'}
+      >
+        <div className="mb-1.5 flex items-center justify-between">
+          <span className="text-xs font-bold">
+            {a.name}
+            {a.connection ? (
+              <span className="ml-1 font-normal text-[var(--tv-muted)]">· {a.connection}</span>
+            ) : null}
+          </span>
+          <span className="flex items-center gap-1.5">
+            {isActive && !isHidden && (
+              <span className="rounded bg-[#2962ff] px-1.5 py-0.5 text-[10px] font-semibold text-white">
+                当前
+              </span>
+            )}
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleHidden(a.name);
+              }}
+              className="rounded p-0.5 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)]"
+              title={isHidden ? '恢复显示该账户' : '隐藏该账户(移到列表底部,交易下拉框不再显示)'}
+            >
+              {isHidden ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+            </button>
+          </span>
+        </div>
+        {hasFin ? (
+          <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+            <span className="text-[var(--tv-muted)]">净清算</span>
+            <span className="text-right font-mono">{fmtMoney(a.netLiquidation)}</span>
+            <span className="text-[var(--tv-muted)]">现金</span>
+            <span className="text-right font-mono">{fmtMoney(a.cashValue)}</span>
+            <span className="text-[var(--tv-muted)]">未实现盈亏</span>
+            <span className={`text-right font-mono ${pnlCls(a.unrealizedPnl)}`}>
+              {fmtMoney(a.unrealizedPnl)}
+            </span>
+            <span className="text-[var(--tv-muted)]">当日已实现</span>
+            <span className={`text-right font-mono ${pnlCls(a.realizedPnl)}`}>
+              {fmtMoney(a.realizedPnl)}
+            </span>
+          </div>
+        ) : (
+          <div className="text-[11px] text-[var(--tv-muted)]">
+            余额/盈亏需要升级桥端(NT8 里 F5 编译 TvBridgeAddOn)后可见
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  /** Connection 分组头(账户页/下拉共用样式) */
+  const renderGroupHeader = (g: AccountGroup) => (
+    <button
+      key={g.connection}
+      onClick={() => toggleGroup(g.connection)}
+      className="flex w-full items-center gap-1 rounded px-1 py-1 text-[11px] font-semibold text-[var(--tv-muted)] transition-colors hover:text-[var(--tv-text)]"
+      title={collapsed.includes(g.connection) ? '展开该组' : '收起该组'}
+    >
+      {collapsed.includes(g.connection) ? (
+        <ChevronRight className="h-3 w-3 shrink-0" />
+      ) : (
+        <ChevronDown className="h-3 w-3 shrink-0" />
+      )}
+      <span className="truncate">{g.connection}</span>
+      <span className="shrink-0 font-normal">({g.items.length})</span>
+    </button>
+  );
 
   return (
     <div className="flex h-full flex-col overflow-y-auto bg-[var(--tv-panel)] text-[var(--tv-text)]">
@@ -283,6 +431,15 @@ export default function TradingPanel({
         </button>
       </div>
 
+      {/* 持仓/订单轮询失败提示(两个页签都可见) */}
+      {pollError && (
+        <div className="mx-2 mt-2 shrink-0 rounded border border-[#ef5350]/40 bg-[#ef5350]/10 px-2 py-1.5 text-[11px] leading-4 text-[#ef5350]">
+          持仓/订单读取失败:{pollError}
+          <br />
+          可在浏览器打开 http://127.0.0.1:8090/api/debug 自查桥端状态
+        </div>
+      )}
+
       {page === 'accounts' ? (
         /* ---- 账户信息页:各账户余额与盈亏 ---- */
         <div className="flex-1 p-3">
@@ -292,71 +449,14 @@ export default function TradingPanel({
             </div>
           )}
           <div className="space-y-2">
-            {sortedAccounts.map((a) => {
-              const isActive = a.name === account;
-              const isHidden = hiddenAccounts.includes(a.name);
-              const hasFin = a.netLiquidation != null || a.cashValue != null;
-              return (
-                <div
-                  key={a.name}
-                  onClick={() => { if (!isHidden) onAccountChange(a.name); }}
-                  className={`w-full rounded border p-2.5 text-left transition-colors ${
-                    isHidden
-                      ? 'cursor-default border-[var(--tv-border)] bg-[var(--tv-bg)] opacity-40 grayscale'
-                      : isActive
-                        ? 'cursor-pointer border-[#2962ff] bg-[#2962ff]/10'
-                        : 'cursor-pointer border-[var(--tv-border)] bg-[var(--tv-bg)] hover:border-[#2962ff]/50'
-                  }`}
-                  title={isHidden ? '已隐藏(点眼睛恢复)' : isActive ? '当前账户' : '点击切换为该账户'}
-                >
-                  <div className="mb-1.5 flex items-center justify-between">
-                    <span className="text-xs font-bold">
-                      {a.name}
-                      {a.connection ? (
-                        <span className="ml-1 font-normal text-[var(--tv-muted)]">· {a.connection}</span>
-                      ) : null}
-                    </span>
-                    <span className="flex items-center gap-1.5">
-                      {isActive && !isHidden && (
-                        <span className="rounded bg-[#2962ff] px-1.5 py-0.5 text-[10px] font-semibold text-white">
-                          当前
-                        </span>
-                      )}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onToggleHidden(a.name);
-                        }}
-                        className="rounded p-0.5 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)]"
-                        title={isHidden ? '恢复显示该账户' : '隐藏该账户(移到列表底部,交易下拉框不再显示)'}
-                      >
-                        {isHidden ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                      </button>
-                    </span>
-                  </div>
-                  {hasFin ? (
-                    <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
-                      <span className="text-[var(--tv-muted)]">净清算</span>
-                      <span className="text-right font-mono">{fmtMoney(a.netLiquidation)}</span>
-                      <span className="text-[var(--tv-muted)]">现金</span>
-                      <span className="text-right font-mono">{fmtMoney(a.cashValue)}</span>
-                      <span className="text-[var(--tv-muted)]">未实现盈亏</span>
-                      <span className={`text-right font-mono ${pnlCls(a.unrealizedPnl)}`}>
-                        {fmtMoney(a.unrealizedPnl)}
-                      </span>
-                      <span className="text-[var(--tv-muted)]">当日已实现</span>
-                      <span className={`text-right font-mono ${pnlCls(a.realizedPnl)}`}>
-                        {fmtMoney(a.realizedPnl)}
-                      </span>
-                    </div>
-                  ) : (
-                    <div className="text-[11px] text-[var(--tv-muted)]">
-                      余额/盈亏需要升级桥端(NT8 里 F5 编译 TvBridgeAddOn)后可见
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+            {groupByConnection(sortedAccounts).map((g) => (
+              <div key={g.connection}>
+                {renderGroupHeader(g)}
+                {!collapsed.includes(g.connection) && (
+                  <div className="space-y-2">{g.items.map(renderAccountCard)}</div>
+                )}
+              </div>
+            ))}
           </div>
           <div className="mt-3 text-[11px] leading-4 text-[var(--tv-muted)]">
             数据每 3 秒随交易轮询刷新;点击卡片可切换当前交易账户;眼睛图标隐藏/恢复账户(隐藏的沉底且不可选)。
@@ -367,19 +467,50 @@ export default function TradingPanel({
       {/* 账户 */}
       <div className="border-b border-[var(--tv-border)] p-3">
         <div className={labelCls}>账户</div>
-        <Select value={account} onValueChange={onAccountChange}>
-          <SelectTrigger className="mt-1 h-8 border-[var(--tv-border)] bg-[var(--tv-bg)] text-xs">
-            <SelectValue placeholder="选择账户" />
-          </SelectTrigger>
-          <SelectContent className="border-[var(--tv-border)] bg-[var(--tv-panel)] text-[var(--tv-text)]">
-            {visibleAccounts.map((a) => (
-              <SelectItem key={a.name} value={a.name}>
-                {a.name}
-                {a.connection ? ` · ${a.connection}` : ''}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        {/* 自绘下拉:shadcn Select 不支持分组折叠 */}
+        <div className="relative mt-1" ref={ddRef}>
+          <button
+            onClick={() => setDdOpen((v) => !v)}
+            className="flex h-8 w-full items-center justify-between rounded-md border border-[var(--tv-border)] bg-[var(--tv-bg)] px-2 text-xs"
+          >
+            <span className="truncate font-mono">
+              {account || '选择账户'}
+              {account && currentAccount?.connection ? (
+                <span className="ml-1 text-[var(--tv-muted)]">· {currentAccount.connection}</span>
+              ) : null}
+            </span>
+            <ChevronDown
+              className={`h-3.5 w-3.5 shrink-0 text-[var(--tv-muted)] transition-transform ${ddOpen ? 'rotate-180' : ''}`}
+            />
+          </button>
+          {ddOpen && (
+            <div className="absolute z-50 mt-1 max-h-72 w-full overflow-y-auto rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)] shadow-lg">
+              {groupByConnection(visibleAccounts).map((g) => (
+                <div key={g.connection}>
+                  {renderGroupHeader(g)}
+                  {!collapsed.includes(g.connection) &&
+                    g.items.map((a) => (
+                      <button
+                        key={a.name}
+                        onClick={() => {
+                          onAccountChange(a.name);
+                          setDdOpen(false);
+                        }}
+                        className={`block w-full px-3 py-1.5 text-left font-mono text-xs transition-colors hover:bg-[#2962ff]/10 ${
+                          a.name === account ? 'bg-[#2962ff]/15 text-[#2962ff]' : ''
+                        }`}
+                      >
+                        {a.name}
+                      </button>
+                    ))}
+                </div>
+              ))}
+              {visibleAccounts.length === 0 && (
+                <div className="px-3 py-2 text-[11px] text-[var(--tv-muted)]">无可用账户</div>
+              )}
+            </div>
+          )}
+        </div>
         {/* 当前账户财务:净值 / 今日已实现 / 浮盈(3 秒轮询刷新) */}
         {currentAccount && (
           <div className="mt-2 grid grid-cols-3 gap-1 rounded bg-[var(--tv-bg)] px-2 py-1.5">

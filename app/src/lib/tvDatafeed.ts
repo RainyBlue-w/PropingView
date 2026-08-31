@@ -105,6 +105,12 @@ export class TvDatafeed {
 
   setAdapter(adapter: FeedAdapter): void {
     this.adapter = adapter;
+    // 旧适配器的最新价/末根 bar 标记作废——回放游标会把时间轴回拨到历史,
+    // 不清掉的话:① getLastPrice 仍是实盘价,模拟市价单会按错价成交;
+    // ② lastBarTimes 守卫会挡住回放历史页(时间早于实盘末根)更新最新价
+    this.lastPrices.clear();
+    this.lastBarTimes.clear();
+    this.lastBars.clear();
     this.onAdapterSwapped?.();
   }
 
@@ -231,15 +237,31 @@ export class TvDatafeed {
     trace('getBars:start', { symbol: symbolInfo?.ticker, resolution, from, to });
     try {
       const intervalSec = resolutionToSeconds(resolution);
+      // 回放会话(ReplaySession)暴露 getCursor:数据右边界在游标处。
+      // 请求窗口必须先钳到游标再取数——否则"游标右侧全空"会触发空页跳窗逻辑,
+      // 初始加载在历史分页上空转(慢且可能跳过游标页)
+      const cursor = (this.adapter as { getCursor?: () => number }).getCursor?.() ?? null;
+      const effectiveTo = cursor != null ? Math.min(to, cursor) : to;
       // 懒加载:单次最多拉 MAX_BARS_PER_REQUEST 根,向左滚动时库会自动分页再调
-      const clampedFrom = Math.max(from, to - MAX_BARS_PER_REQUEST * intervalSec);
-      const raw = await this.adapter.getHistory(symbolInfo.ticker, intervalSec, clampedFrom, to);
+      const clampedFrom = Math.max(from, effectiveTo - MAX_BARS_PER_REQUEST * intervalSec);
+      const raw = await this.adapter.getHistory(symbolInfo.ticker, intervalSec, clampedFrom, effectiveTo);
       // NT8 桥按整天/会话取整返回,可能含请求区间之外的 bar;
       // 库校验 "returned data should be in the requested range" 失败会升级
       // 为全量更新并反复重试(超大下载量的根因)——这里严格过滤到 [from,to]
-      const bars = raw.filter((b) => b.time >= clampedFrom && b.time <= to);
+      const bars = raw.filter((b) => b.time >= clampedFrom && b.time <= effectiveTo);
       trace('getBars:done', { count: bars.length, rawCount: raw.length });
       if (!bars.length) {
+        if (cursor != null) {
+          // 回放:空窗口 = 游标右侧区域。原先给周末空窗设计的 10 天向后探针
+          // 够不到远期游标(会误判 EOD 导致整图空白),改为直接取游标前一页
+          const pageFrom = Math.max(0, cursor - MAX_BARS_PER_REQUEST * intervalSec);
+          const page = await this.adapter.getHistory(symbolInfo.ticker, intervalSec, pageFrom, cursor);
+          const pageBars = page.filter((b) => b.time >= pageFrom && b.time <= cursor);
+          trace('getBars:emptyPageReplay', { pageBars: pageBars.length });
+          if (pageBars.length) onResult([], { nextTime: pageBars[pageBars.length - 1].time });
+          else onResult([], { noData: true });
+          return;
+        }
         // 空窗口(多为周末/节假日无交易):绝不能直接 noData:true——库会判定
         // 数据尽头(EOD)并永久停止向左分页。找窗口之前最近的一根 bar,用
         // nextTime 告诉库"下一页从这里继续",跳过空窗;确实更老也没有时才 EOD

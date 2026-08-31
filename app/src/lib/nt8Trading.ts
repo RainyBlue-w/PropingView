@@ -70,6 +70,10 @@ export interface PlaceOrderPayload {
   tp?: number;
   /** 止损价(可选) */
   sl?: number;
+  /** 止盈金额$(可选,仅市价单):成交后按实际成交均价换算止盈价,避免滑点偏移 */
+  tpAmount?: number;
+  /** 止损金额$(可选,仅市价单) */
+  slAmount?: number;
 }
 
 async function request<T>(path: string, init?: RequestInit, timeoutMs = 10000): Promise<T> {

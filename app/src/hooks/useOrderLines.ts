@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
-import { nt8Trading, type Nt8Bracket, type Nt8Order, type Nt8Position } from '@/lib/nt8Trading';
+import { trading } from '@/lib/tradingRouter';
+import { type Nt8Bracket, type Nt8Order, type Nt8Position } from '@/lib/nt8Trading';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -224,7 +225,7 @@ export function useOrderLines({
         if (acc) {
           // 撤单确认前的轮询仍含该订单,标记期间禁止同步效应重建线
           pendingCancelRef.current.set(found[0], Date.now());
-          nt8Trading
+          trading
             .cancelOrder(acc, found[0])
             .catch(() => pendingCancelRef.current.delete(found[0]))   // 撤单失败:允许重建
             .finally(() => onChangedRef.current());
@@ -371,7 +372,7 @@ export function useOrderLines({
       if (!acc) return;
       const field = entry.orderType === 'Limit' ? { limitPrice: p } : { stopPrice: p };
       settleRef.current.set(orderId, { price: p, ts: Date.now() });
-      nt8Trading
+      trading
         .changeOrder(acc, orderId, field)
         .catch(() => {
           // 改单被拒:线弹回原价,等下轮轮询与 NT8 真实状态对齐

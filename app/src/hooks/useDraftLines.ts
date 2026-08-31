@@ -71,6 +71,8 @@ interface UseDraftLinesParams {
   onEntryChange: (price: number) => void;
   /** 图表主题:决定虚线文字颜色 */
   theme: 'dark' | 'light';
+  /** 周期纪元:切换时间周期时 +1,触发草稿线整体重建(库在切周期时可能残留旧线) */
+  epoch: number;
 }
 
 /**
@@ -98,6 +100,7 @@ export function useDraftLines({
   onAmount,
   onEntryChange,
   theme,
+  epoch,
 }: UseDraftLinesParams) {
   const linesRef = useRef(new Map<DraftWhich, DraftEntry>());
   const creatingRef = useRef(new Set<DraftWhich>());
@@ -126,6 +129,8 @@ export function useDraftLines({
   ctxRef.current = { side, refPrice, qty, tickSize, pointValue };
   /** 上次同步时的合约,用于合约切换时清线 */
   const prevSymbolRef = useRef('');
+  /** 上次同步时的周期纪元,用于周期切换时整体重建草稿线 */
+  const prevEpochRef = useRef(epoch);
 
   // ---- drawing_event 订阅:拖拽回填 + 删线清空 ----
   useEffect(() => {
@@ -321,6 +326,18 @@ export function useDraftLines({
       removeLine('entry');
     }
 
+    // 切换周期:库在周期切换时对绘图的状态维护不可靠(可能出现 getShapeById 短暂失败
+    // 导致旧线滞留、新线又建一条的重复),统一清掉重建,并丢弃进行中的拖拽/结算状态
+    if (prevEpochRef.current !== epoch) {
+      prevEpochRef.current = epoch;
+      for (const pend of Array.from(pendingMoveRef.current.values())) clearTimeout(pend.timer);
+      pendingMoveRef.current.clear();
+      settleRef.current.clear();
+      removeLine('tp');
+      removeLine('sl');
+      removeLine('entry');
+    }
+
     // 退出草稿模式:清掉所有草稿线
     if (!active) {
       removeLine('tp');
@@ -443,7 +460,7 @@ export function useDraftLines({
       }
       upsert(spec.which, target, `草稿${spec.isTp ? '止盈' : '止损'} $${amount} · ${qty}手`, spec.color);
     }
-  }, [widget, symbol, active, side, refPrice, showEntry, entryPrice, qty, tickSize, pointValue, tpAmount, slAmount, theme]);
+  }, [widget, symbol, active, side, refPrice, showEntry, entryPrice, qty, tickSize, pointValue, tpAmount, slAmount, theme, epoch]);
 
   // 组件卸载时清理
   useEffect(() => {
