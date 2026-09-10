@@ -16,6 +16,7 @@ const EXCHANGE = 'NT8';
 
 /** 懒加载:单次 getBars 最多返回的 K 线根数;向左滚动时库会自动分页继续请求 */
 const MAX_BARS_PER_REQUEST = 500;
+const ADAPTER_CHANGED_MESSAGE = '数据源已切换，请重新请求行情。';
 
 function pricescaleOf(tickSize: number | undefined): { minmov: number; pricescale: number } {
   if (!tickSize || tickSize <= 0) return { minmov: 1, pricescale: 100 };
@@ -57,6 +58,7 @@ function trace(method: string, detail?: unknown): void {
       t: new Date().toISOString(),
       d: detail === undefined ? null : JSON.parse(JSON.stringify(detail, (_k, v) => (typeof v === 'function' ? '[fn]' : v))),
     });
+    if (w.__dfLog.length > 500) w.__dfLog.shift();
   } catch {
     /* ignore */
   }
@@ -68,6 +70,8 @@ function trace(method: string, detail?: unknown): void {
  */
 export class TvDatafeed {
   private adapter: FeedAdapter;
+  /** 切换后旧请求及迟到流帧不能再写入新会话的行情缓存。 */
+  private adapterGeneration = 0;
   private subscriptions = new Map<string, () => void>();
   /** 各合约最新价(subscribeBars 的 tick 与 getBars 的末根 bar 收盘价) */
   private lastPrices = new Map<string, number>();
@@ -104,6 +108,10 @@ export class TvDatafeed {
   }
 
   setAdapter(adapter: FeedAdapter): void {
+    // 必须先失效：部分适配器的退订函数仍可能同步派发最后一帧。
+    this.adapterGeneration += 1;
+    for (const unsubscribe of this.subscriptions.values()) unsubscribe();
+    this.subscriptions.clear();
     this.adapter = adapter;
     // 旧适配器的最新价/末根 bar 标记作废——回放游标会把时间轴回拨到历史,
     // 不清掉的话:① getLastPrice 仍是实盘价,模拟市价单会按错价成交;
@@ -115,7 +123,21 @@ export class TvDatafeed {
   }
 
   async listSymbols(): Promise<SymbolInfo[]> {
-    return this.adapter.getSymbols();
+    // UI 调用没有取消回调；切换期间重新读取当前源，不能返回旧合约元数据。
+    for (;;) {
+      const generation = this.adapterGeneration;
+      const adapter = this.adapter;
+      try {
+        const symbols = await adapter.getSymbols();
+        if (generation === this.adapterGeneration) return symbols;
+      } catch (err) {
+        if (generation === this.adapterGeneration) throw err;
+      }
+    }
+  }
+
+  private assertAdapterGeneration(generation: number): void {
+    if (generation !== this.adapterGeneration) throw new Error(ADAPTER_CHANGED_MESSAGE);
   }
 
   onReady(callback: (config: any) => void): void {
@@ -145,8 +167,17 @@ export class TvDatafeed {
     _symbolType: string,
     onResult: (items: any[]) => void,
   ): Promise<void> {
+    const generation = this.adapterGeneration;
+    const adapter = this.adapter;
     const query = userInput.trim().toLowerCase();
-    const symbols = await this.adapter.getSymbols();
+    let symbols: SymbolInfo[];
+    try {
+      symbols = await adapter.getSymbols();
+      this.assertAdapterGeneration(generation);
+    } catch {
+      onResult([]);
+      return;
+    }
     const matched = symbols
       .filter(
         (s) =>
@@ -157,13 +188,18 @@ export class TvDatafeed {
       .slice(0, 30);
 
     // 列表里没匹配到时,尝试按输入的原名直接向后端解析(如手动输入新月份合约)
-    if (matched.length === 0 && query && this.adapter.resolve) {
+    if (matched.length === 0 && query && adapter.resolve) {
       try {
-        const resolved = await this.adapter.resolve(userInput.trim());
+        const resolved = await adapter.resolve(userInput.trim());
         if (resolved) matched.push(resolved);
       } catch {
         /* 未解析到则返回空 */
       }
+    }
+
+    if (generation !== this.adapterGeneration) {
+      onResult([]);
+      return;
     }
 
     onResult(
@@ -183,13 +219,17 @@ export class TvDatafeed {
     onResolve: (info: any) => void,
     onError: (reason: string) => void,
   ): Promise<void> {
+    const generation = this.adapterGeneration;
+    const adapter = this.adapter;
     trace('resolveSymbol:start', symbolName);
     try {
-      const symbols = await this.adapter.getSymbols();
+      const symbols = await adapter.getSymbols();
+      this.assertAdapterGeneration(generation);
       let found = symbols.find((s) => s.symbol === symbolName);
       // 不在列表时,向后端按名解析(支持 Watchlist 之外的合约)
-      if (!found && this.adapter.resolve) {
-        found = (await this.adapter.resolve(symbolName)) ?? undefined;
+      if (!found && adapter.resolve) {
+        found = (await adapter.resolve(symbolName)) ?? undefined;
+        this.assertAdapterGeneration(generation);
       }
       if (!found) {
         trace('resolveSymbol:notFound', symbolName);
@@ -222,7 +262,7 @@ export class TvDatafeed {
       });
     } catch (err) {
       trace('resolveSymbol:error', String(err));
-      onError(err instanceof Error ? err.message : '合约解析失败');
+      onError(generation !== this.adapterGeneration ? ADAPTER_CHANGED_MESSAGE : err instanceof Error ? err.message : '合约解析失败');
     }
   }
 
@@ -233,6 +273,8 @@ export class TvDatafeed {
     onResult: (bars: any[], meta?: any) => void,
     onError: (reason: string) => void,
   ): Promise<void> {
+    const generation = this.adapterGeneration;
+    const adapter = this.adapter;
     const { from, to } = periodParams;
     trace('getBars:start', { symbol: symbolInfo?.ticker, resolution, from, to });
     try {
@@ -240,22 +282,25 @@ export class TvDatafeed {
       // 回放会话(ReplaySession)暴露 getCursor:数据右边界在游标处。
       // 请求窗口必须先钳到游标再取数——否则"游标右侧全空"会触发空页跳窗逻辑,
       // 初始加载在历史分页上空转(慢且可能跳过游标页)
-      const cursor = (this.adapter as { getCursor?: () => number }).getCursor?.() ?? null;
+      const cursor = (adapter as { getCursor?: () => number }).getCursor?.() ?? null;
       const effectiveTo = cursor != null ? Math.min(to, cursor) : to;
       // 懒加载:单次最多拉 MAX_BARS_PER_REQUEST 根,向左滚动时库会自动分页再调
       const clampedFrom = Math.max(from, effectiveTo - MAX_BARS_PER_REQUEST * intervalSec);
-      const raw = await this.adapter.getHistory(symbolInfo.ticker, intervalSec, clampedFrom, effectiveTo);
+      const raw = await adapter.getHistory(symbolInfo.ticker, intervalSec, clampedFrom, effectiveTo);
+      this.assertAdapterGeneration(generation);
       // NT8 桥按整天/会话取整返回,可能含请求区间之外的 bar;
       // 库校验 "returned data should be in the requested range" 失败会升级
       // 为全量更新并反复重试(超大下载量的根因)——这里严格过滤到 [from,to]
-      const bars = raw.filter((b) => b.time >= clampedFrom && b.time <= effectiveTo);
+      const bars = [...new Map(raw.filter((b) => b.time >= clampedFrom && b.time < to && b.time <= effectiveTo)
+        .map(b => [b.time, b])).values()].sort((a, b) => a.time - b.time).slice(-MAX_BARS_PER_REQUEST);
       trace('getBars:done', { count: bars.length, rawCount: raw.length });
       if (!bars.length) {
         if (cursor != null) {
           // 回放:空窗口 = 游标右侧区域。原先给周末空窗设计的 10 天向后探针
           // 够不到远期游标(会误判 EOD 导致整图空白),改为直接取游标前一页
           const pageFrom = Math.max(0, cursor - MAX_BARS_PER_REQUEST * intervalSec);
-          const page = await this.adapter.getHistory(symbolInfo.ticker, intervalSec, pageFrom, cursor);
+          const page = await adapter.getHistory(symbolInfo.ticker, intervalSec, pageFrom, cursor);
+          this.assertAdapterGeneration(generation);
           const pageBars = page.filter((b) => b.time >= pageFrom && b.time <= cursor);
           trace('getBars:emptyPageReplay', { pageBars: pageBars.length });
           if (pageBars.length) onResult([], { nextTime: pageBars[pageBars.length - 1].time });
@@ -267,7 +312,8 @@ export class TvDatafeed {
         // nextTime 告诉库"下一页从这里继续",跳过空窗;确实更老也没有时才 EOD
         const olderTo = clampedFrom - 1;
         const olderFrom = Math.max(0, olderTo - 10 * 86400);
-        const older = await this.adapter.getHistory(symbolInfo.ticker, intervalSec, olderFrom, olderTo);
+        const older = await adapter.getHistory(symbolInfo.ticker, intervalSec, olderFrom, olderTo);
+        this.assertAdapterGeneration(generation);
         const olderBars = older.filter((b) => b.time >= olderFrom && b.time <= olderTo);
         trace('getBars:emptyPage', { older: olderBars.length });
         if (olderBars.length) onResult([], { nextTime: olderBars[olderBars.length - 1].time });
@@ -285,7 +331,8 @@ export class TvDatafeed {
       onResult(bars.map(toTvBar), { noData: false });
     } catch (err) {
       trace('getBars:error', String(err));
-      onError(err instanceof Error ? err.message : '历史数据加载失败');
+      // 旧 widget 仍收到终止回调，避免其请求永远处于 loading；不交付旧源 bars。
+      onError(generation !== this.adapterGeneration ? ADAPTER_CHANGED_MESSAGE : err instanceof Error ? err.message : '历史数据加载失败');
     }
   }
 
@@ -296,6 +343,9 @@ export class TvDatafeed {
     listenerGuid: string,
   ): void {
     trace('subscribeBars', { symbol: symbolInfo?.ticker, resolution, listenerGuid });
+    this.unsubscribeBars(listenerGuid);
+    const generation = this.adapterGeneration;
+    let closed = false;
     const intervalSec = resolutionToSeconds(resolution);
     const key = `${symbolInfo.ticker}|${intervalSec}`;
     // 单调性守卫:桥端快照/乱序 tick 可能带来时间倒退的 bar,库会报
@@ -303,6 +353,7 @@ export class TvDatafeed {
     let lastSec = this.lastBarTimes.get(key) ?? 0;
     const seed = this.lastBars.get(key);
     const unsubscribe = this.adapter.subscribe(symbolInfo.ticker, intervalSec, (bar) => {
+      if (closed || generation !== this.adapterGeneration) return;
       if (bar.time < lastSec) return;
       // 桥端每次新订阅会用最近成交价造一帧同桶快照(open/high/low 全是切换时刻
       // 的最新价),直接把历史末根 bar 覆盖掉。同桶帧用历史末根回填开盘价,
@@ -319,11 +370,15 @@ export class TvDatafeed {
       }
       lastSec = bar.time;
       this.lastBarTimes.set(key, bar.time);
+      this.lastBars.set(key, bar);
       this.lastPrices.set(symbolInfo.ticker, bar.close);
       for (const fn of this.priceListeners) fn(symbolInfo.ticker, bar.close);
       onTick(toTvBar(bar));
     });
-    this.subscriptions.set(listenerGuid, unsubscribe);
+    this.subscriptions.set(listenerGuid, () => {
+      closed = true;
+      unsubscribe();
+    });
   }
 
   unsubscribeBars(listenerGuid: string): void {

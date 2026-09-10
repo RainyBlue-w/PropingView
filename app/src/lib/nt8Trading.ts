@@ -51,10 +51,38 @@ export interface Nt8Bracket {
 /** 成交记录(图上交易历史 mark 用) */
 export interface Nt8Execution {
   time: number;
+  /** NT8 原始成交时间精度，FIFO 排序优先于整秒图表时间。 */
+  timeMs?: number;
+  /** 同一模拟行情时间内的实际撮合顺序。 */
+  sequence?: number;
   price: number;
   qty: number;
   side: 'Buy' | 'Sell' | string;
   orderId: string;
+  executionId?: string;
+  instrument?: string;
+  commission?: number;
+  account?: string;
+  pointValue?: number;
+  currency?: string;
+}
+
+export interface ExecutionPage {
+  executions: Nt8Execution[];
+  total?: number;
+  nextOffset?: number | null;
+  archive?: ExecutionArchiveStatus;
+}
+
+export interface ExecutionArchiveStatus {
+  version: number;
+  state: 'ready' | 'loading' | 'error';
+  path?: string;
+  recordCount: number;
+  pendingCount: number;
+  lastSavedAt?: number;
+  error?: string;
+  warning?: string;
 }
 
 export interface PlaceOrderPayload {
@@ -111,13 +139,18 @@ export const nt8Trading = {
     ),
 
   getBrackets: (account: string) =>
-    request<{ brackets: Nt8Bracket[] }>(
+    request<{ brackets: Nt8Bracket[]; syncError?: string }>(
       `/api/brackets?account=${encodeURIComponent(account)}`,
     ),
 
   getExecutions: (account: string, symbol: string, from: number, to: number) =>
     request<{ executions: Nt8Execution[] }>(
       `/api/executions?account=${encodeURIComponent(account)}&symbol=${encodeURIComponent(symbol)}&from=${from}&to=${to}`,
+    ),
+
+  getExecutionPage: (account: string, symbol: string, from: number, to: number, offset = 0, limit = 100) =>
+    request<ExecutionPage>(
+      `/api/executions?account=${encodeURIComponent(account)}&symbol=${encodeURIComponent(symbol)}&from=${from}&to=${to}&offset=${offset}&limit=${limit}`,
     ),
 
   placeOrder: (payload: PlaceOrderPayload) =>

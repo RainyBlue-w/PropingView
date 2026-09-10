@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Search, Star, X } from 'lucide-react';
 import type { SymbolInfo } from '@/types/market';
 
@@ -22,6 +22,7 @@ function loadFavs(): string[] {
 }
 
 interface Props {
+  dragHandle?: ReactNode;
   /** 拉取候选合约列表(NT8 合约库) */
   listSymbols: () => Promise<SymbolInfo[]>;
   /** 当前图表合约 */
@@ -30,7 +31,7 @@ interface Props {
   onSelect: (symbol: string) => void;
 }
 
-export default function SymbolFavorites({ listSymbols, current, onSelect }: Props) {
+export default function SymbolFavorites({ listSymbols, current, onSelect, dragHandle }: Props) {
   const [favs, setFavs] = useState<string[]>(loadFavs);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -38,14 +39,20 @@ export default function SymbolFavorites({ listSymbols, current, onSelect }: Prop
   const [loading, setLoading] = useState(false);
   const boxRef = useRef<HTMLDivElement>(null);
 
-  // 点击外部收起下拉
+  // 点击外部收起下拉;图表在 iframe 里,点进 iframe 时外层 document 收不到
+  // mousedown(事件被 iframe 吃掉),用 window blur 兜底(焦点进 iframe 会触发)
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
       if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
     };
+    const onBlur = () => setOpen(false);
     document.addEventListener('mousedown', onDoc);
-    return () => document.removeEventListener('mousedown', onDoc);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      window.removeEventListener('blur', onBlur);
+    };
   }, [open]);
 
   // 首次打开下拉时加载候选列表
@@ -76,11 +83,23 @@ export default function SymbolFavorites({ listSymbols, current, onSelect }: Prop
   };
 
   const q = query.trim().toLowerCase();
-  const filtered = symbols.filter(
-    (s) =>
-      !q || s.symbol.toLowerCase().includes(q) || (s.name ?? '').toLowerCase().includes(q),
-  );
-  // 收藏的固定在结果最上方,其余按名称
+  /** 匹配分级:合约代码从头匹配 > 代码包含 > 名称从头 > 名称包含(搜 NQ 时 MNQ 不得排在 NQ 前面) */
+  const rankOf = (s: SymbolInfo): number => {
+    if (!q) return 0;
+    const sym = s.symbol.toLowerCase();
+    if (sym.startsWith(q)) return 0;
+    if (sym.includes(q)) return 1;
+    const nm = (s.name ?? '').toLowerCase();
+    if (nm.startsWith(q)) return 2;
+    return 3;
+  };
+  const filtered = symbols
+    .filter(
+      (s) =>
+        !q || s.symbol.toLowerCase().includes(q) || (s.name ?? '').toLowerCase().includes(q),
+    )
+    .sort((a, b) => rankOf(a) - rankOf(b) || a.symbol.localeCompare(b.symbol));
+  // 收藏的固定在结果最上方(组内同样已按匹配分级排序),其余按名称
   const rows = [
     ...filtered.filter((s) => favs.includes(s.symbol)),
     ...filtered.filter((s) => !favs.includes(s.symbol)),
@@ -91,8 +110,9 @@ export default function SymbolFavorites({ listSymbols, current, onSelect }: Prop
   return (
     <div
       ref={boxRef}
-      className="relative flex max-w-[75vw] items-center gap-1 rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)]/95 px-1.5 py-1 shadow-lg backdrop-blur"
+      className="relative flex max-w-full flex-wrap items-center gap-1 rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)]/95 px-1.5 py-1 shadow-lg backdrop-blur"
     >
+      {dragHandle}
       {/* 搜索框(聚焦/输入展开结果,收藏置顶) */}
       <div className="relative shrink-0">
         <Search className="pointer-events-none absolute left-1.5 top-1/2 h-3 w-3 -translate-y-1/2 text-[var(--tv-muted)]" />
@@ -176,7 +196,7 @@ export default function SymbolFavorites({ listSymbols, current, onSelect }: Prop
                     >
                       <Star className={`h-3 w-3 ${fav ? 'fill-[#f0b90b] text-[#f0b90b]' : ''}`} />
                     </button>
-                    <span className="shrink-0 font-mono">{s.symbol}</span>
+                    <span className="shrink-0 font-mono text-[var(--tv-text)]">{s.symbol}</span>
                     <span className="truncate text-[11px] text-[var(--tv-muted)]">{s.name}</span>
                     {i === 0 && (
                       <span className="ml-auto shrink-0 text-[10px] text-[var(--tv-muted)]">

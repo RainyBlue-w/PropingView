@@ -1,6 +1,7 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { trading } from '@/lib/tradingRouter';
 import { type Nt8Bracket, type Nt8Order, type Nt8Position } from '@/lib/nt8Trading';
+import { onBeforeLayoutLoad } from '@/lib/tvLayoutEvents';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -15,14 +16,6 @@ function roundToTick(price: number, tick: number): number {
   if (!tick || tick <= 0) return Math.round(price * 10000) / 10000;
   const decimals = Math.max(0, Math.ceil(-Math.log10(tick)));
   return Number((Math.round(price / tick) * tick).toFixed(decimals + 1));
-}
-
-/** 按 tick 推小数位数(0.25 -> 2 位,0.1 -> 1 位) */
-function tickDecimals(tick: number): number {
-  if (!tick || tick <= 0) return 2;
-  let d = 0;
-  while (d < 8 && Math.abs(tick * 10 ** d - Math.round(tick * 10 ** d)) > 1e-9) d++;
-  return d;
 }
 
 interface LineEntry {
@@ -65,6 +58,8 @@ interface UseOrderLinesParams {
   subscribePrice: (fn: (symbol: string, price: number) => void) => () => void;
   /** 图表主题:决定线条文字颜色(切换时由同步效应重写 textcolor) */
   theme: 'dark' | 'light';
+  /** 布局或周期更新后重新同步当前订单和持仓线。 */
+  epoch: number;
   onChanged: () => void;
 }
 
@@ -93,10 +88,14 @@ export function useOrderLines({
   getLastPrice,
   subscribePrice,
   theme,
+  epoch,
   onChanged,
 }: UseOrderLinesParams) {
   const linesRef = useRef(new Map<string, LineEntry>());
   const creatingRef = useRef(new Set<string>());
+  const loadingLayoutRef = useRef(false);
+  const drawingGenerationRef = useRef(0);
+  const [layoutRevision, setLayoutRevision] = useState(0);
   /** 我们自己主动 removeEntity 的 id,避免 remove 事件误触发撤单 */
   const intentionalRemoveRef = useRef(new Set<string>());
   /** 程序化 setPoints 的价格指纹(entityId -> price):points_changed 事件
@@ -202,9 +201,63 @@ export function useOrderLines({
     return label;
   };
 
+  // 加载布局会自动删除旧绘图，不能将这些事件当作手动撤单或改单。
+  useEffect(() => {
+    if (!widget) return;
+    loadingLayoutRef.current = false;
+    const discardLines = () => {
+      drawingGenerationRef.current += 1;
+      creatingRef.current = new Set();
+      for (const pending of pendingMoveRef.current.values()) clearTimeout(pending.timer);
+      pendingMoveRef.current.clear();
+      settleRef.current.clear();
+      pendingCancelRef.current.clear();
+      progWriteRef.current.clear();
+      const entries = Array.from(linesRef.current.values());
+      linesRef.current.clear();
+      let chart: any = null;
+      try { chart = widget.activeChart(); } catch { /* 图表已销毁 */ }
+      for (const entry of entries) {
+        intentionalRemoveRef.current.add(String(entry.id));
+        try { chart?.removeEntity(entry.id); } catch { /* 旧布局已经移除绘图 */ }
+      }
+    };
+    const onLoadRequested = () => {
+      loadingLayoutRef.current = true;
+      discardLines();
+    };
+    const onLoaded = () => {
+      loadingLayoutRef.current = true;
+      discardLines();
+      const generation = drawingGenerationRef.current;
+      let resumed = false;
+      const resume = () => {
+        if (resumed || generation !== drawingGenerationRef.current || widgetRef.current !== widget) return;
+        resumed = true;
+        loadingLayoutRef.current = false;
+        // 不依赖宿主 chart_loaded 订阅的先后顺序，数据就绪后主动重建。
+        setLayoutRevision((revision) => revision + 1);
+      };
+      try {
+        if (widget.activeChart().dataReady(resume)) resume();
+      } catch { /* 图表已销毁，下次布局加载重新恢复 */ }
+    };
+    const unsubscribeBeforeLoad = onBeforeLayoutLoad(widget, onLoadRequested);
+    widget.subscribe?.('chart_load_requested', onLoadRequested);
+    widget.subscribe?.('chart_loaded', onLoaded);
+    return () => {
+      loadingLayoutRef.current = true;
+      discardLines();
+      unsubscribeBeforeLoad();
+      try { widget.unsubscribe?.('chart_load_requested', onLoadRequested); } catch { /* ignore */ }
+      try { widget.unsubscribe?.('chart_loaded', onLoaded); } catch { /* ignore */ }
+    };
+  }, [widget]);
+
   // ---- drawing_event 订阅(每个 widget 一次):拖拽改价 + 删线撤单 ----
   useEffect(() => {
     if (!widget) return;
+    const pendingMoves = pendingMoveRef.current;
 
     const findByEntityId = (entityId: string): [string, LineEntry] | null => {
       for (const kv of Array.from(linesRef.current.entries())) {
@@ -215,6 +268,10 @@ export function useOrderLines({
 
     const handler = (id: any, type: string) => {
       const entityId = String(id);
+      if (loadingLayoutRef.current) {
+        if (type === 'remove') intentionalRemoveRef.current.delete(entityId);
+        return;
+      }
 
       if (type === 'remove') {
         if (intentionalRemoveRef.current.delete(entityId)) return; // 我们自己删的
@@ -313,6 +370,7 @@ export function useOrderLines({
      * 结算后把线吸附到改单价,使"线停在哪 / 改到什么价 / 轴上显示什么价"一致。
      */
     const flushMove = (orderId: string) => {
+      if (loadingLayoutRef.current) return;
       const pend = pendingMoveRef.current.get(orderId);
       if (!pend) return;
       pendingMoveRef.current.delete(orderId);
@@ -321,10 +379,12 @@ export function useOrderLines({
       const tick = ctxRef.current.tickSize;
       const eps = tick > 0 ? tick / 4 : 1e-9;
       const delta = pend.price - entry.price;
+      const generation = drawingGenerationRef.current;
 
       // 程序化写线:锚点固定回创建时间(订单线锚点的横向位置无意义),
       // 并记录价格指纹,防止随后的 points_changed 被误判为用户拖拽
       const setLine = (price: number) => {
+        if (loadingLayoutRef.current || generation !== drawingGenerationRef.current) return;
         try {
           const shape = (widget as any).activeChart().getShapeById(entry.id);
           if (shape) {
@@ -375,6 +435,7 @@ export function useOrderLines({
       trading
         .changeOrder(acc, orderId, field)
         .catch(() => {
+          if (generation !== drawingGenerationRef.current) return;
           // 改单被拒:线弹回原价,等下轮轮询与 NT8 真实状态对齐
           settleRef.current.delete(orderId);
           entry.price = oldPrice;
@@ -398,136 +459,16 @@ export function useOrderLines({
     return () => {
       try { (widget as any).unsubscribe('drawing_event', handler); } catch { /* ignore */ }
       window.removeEventListener('mouseup', onMouseUp, true);
-      for (const pend of Array.from(pendingMoveRef.current.values())) clearTimeout(pend.timer);
-      pendingMoveRef.current.clear();
+      for (const pend of pendingMoves.values()) clearTimeout(pend.timer);
+      pendingMoves.clear();
     };
   }, [widget]);
-
-  // ---- 悬浮带括号单的入场线 -> 显示其待触发止盈/止损位置(锁定虚线预览,平时隐藏) ----
-  useEffect(() => {
-    if (!widget) return;
-    let chart: any = null;
-    try { chart = (widget as any).activeChart(); } catch { chart = null; }
-    if (!chart || typeof chart.crossHairMoved !== 'function') return;
-
-    const previews = new Map<string, { tpId?: any; slId?: any }>();
-    const shownFor = new Map<string, { tp: number; sl: number }>();
-
-    const hidePreview = (orderId: string) => {
-      shownFor.delete(orderId);
-      const p = previews.get(orderId);
-      previews.delete(orderId);
-      for (const id of [p?.tpId, p?.slId]) {
-        if (id == null) continue;
-        intentionalRemoveRef.current.add(String(id));
-        try { chart.removeEntity(id); }
-        catch { intentionalRemoveRef.current.delete(String(id)); }
-      }
-    };
-
-    const showPreview = (orderId: string, br: Nt8Bracket, o: Nt8Order | undefined) => {
-      const tick = ctxRef.current.tickSize;
-      const decimals = tickDecimals(tick);
-      const isBuy = o ? o.action.startsWith('Buy') : true;
-      const qty = o ? Math.max(1, o.quantity - o.filled) : 1;
-      const dir = isBuy ? 1 : -1;
-      const entryPx = o ? o.limitPrice || o.stopPrice : 0;
-      const pv = ctxRef.current.pointValue > 0 ? ctxRef.current.pointValue : 1;
-      const amt = (px: number) =>
-        Math.round((px - entryPx) * dir * pv * qty * 100) / 100;
-      const nowSec = Math.round(Date.now() / 1000);
-      shownFor.set(orderId, { tp: br.tp, sl: br.sl });
-      previews.set(orderId, {});
-
-      const mk = async (which: 'tp' | 'sl', px: number, text: string, color: string) => {
-        try {
-          const id = await chart.createMultipointShape([{ time: nowSec, price: px }], {
-            shape: 'horizontal_line',
-            lock: true,
-            disableSelection: true,
-            disableSave: true,
-            overrides: {
-              linecolor: color,
-              linewidth: 1,
-              linestyle: 2,
-              text,
-              showLabel: true,
-              textcolor: color,
-              fontsize: 12,
-              showPrice: true,
-              horzLabelsAlign: 'right',
-            },
-          });
-          // 创建返回时鼠标已移开 -> 立即删掉,避免残留
-          if (!shownFor.has(orderId)) {
-            intentionalRemoveRef.current.add(String(id));
-            try { chart.removeEntity(id); }
-            catch { intentionalRemoveRef.current.delete(String(id)); }
-            return;
-          }
-          const cur = previews.get(orderId);
-          if (cur) cur[which === 'tp' ? 'tpId' : 'slId'] = id;
-        } catch { /* 图表未就绪 */ }
-      };
-
-      if (br.tp > 0) {
-        const v = amt(br.tp);
-        void mk('tp', br.tp, `TP ${v >= 0 ? '+' : ''}${v}$ @ ${br.tp.toFixed(decimals)}`, '#26a69a');
-      }
-      if (br.sl > 0) {
-        const v = amt(br.sl);
-        void mk('sl', br.sl, `SL ${v >= 0 ? '+' : ''}${v}$ @ ${br.sl.toFixed(decimals)}`, '#ef5350');
-      }
-    };
-
-    const onCross = (param: any) => {
-      const price = param && typeof param.price === 'number' ? param.price : null;
-      const tick = ctxRef.current.tickSize;
-      const tol = (tick > 0 ? tick : 0.01) * 4;
-
-      // 找"带括号单的入场线"中,离十字光标价格最近且在容差内的那条
-      let hovered: string | null = null;
-      let best = Infinity;
-      if (price != null) {
-        for (const kv of Array.from(linesRef.current.entries())) {
-          const [orderId, entry] = kv;
-          if (orderId.startsWith('__')) continue;
-          const br = bracketsRef.current.find((b) => b.entryOrderId === orderId);
-          if (!br || (br.tp <= 0 && br.sl <= 0)) continue;
-          const d = Math.abs(entry.price - price);
-          if (d <= tol && d < best) {
-            best = d;
-            hovered = orderId;
-          }
-        }
-      }
-
-      for (const orderId of Array.from(shownFor.keys())) {
-        if (orderId !== hovered) hidePreview(orderId);
-      }
-      if (hovered) {
-        const br = bracketsRef.current.find((b) => b.entryOrderId === hovered);
-        if (br) {
-          const cur = shownFor.get(hovered);
-          if (!cur || cur.tp !== br.tp || cur.sl !== br.sl) {
-            hidePreview(hovered);
-            showPreview(hovered, br, ordersRef.current.find((x) => x.orderId === hovered));
-          }
-        }
-      }
-    };
-
-    chart.crossHairMoved().subscribe(null, onCross);
-    return () => {
-      try { chart.crossHairMoved().unsubscribe(null, onCross); } catch { /* ignore */ }
-      for (const orderId of Array.from(shownFor.keys())) hidePreview(orderId);
-    };
-  }, [widget, symbol]);
 
   // ---- 持仓线浮动盈亏:随最新价 tick 即时刷新文本 ----
   useEffect(() => {
     if (!widget) return;
     const update = () => {
+      if (loadingLayoutRef.current) return;
       const entry = linesRef.current.get('__position__');
       if (!entry) return;
       const pos = positionsRef.current.find((p) => p.instrument === symbolRef.current);
@@ -546,12 +487,20 @@ export function useOrderLines({
 
   // ---- 订单/持仓 -> 水平线 同步 ----
   useEffect(() => {
-    if (!widget || !symbol || !account) return;
+    if (!widget || !symbol || !account || loadingLayoutRef.current) return;
     let chart: any = null;
     try { chart = (widget as any).activeChart(); } catch { chart = null; }
     if (!chart) return;
 
     const lines = linesRef.current;
+    const creating = creatingRef.current;
+    const generation = drawingGenerationRef.current;
+    const discardStaleShape = (id: any): boolean => {
+      if (generation === drawingGenerationRef.current && widgetRef.current === widget && !loadingLayoutRef.current) return false;
+      intentionalRemoveRef.current.add(String(id));
+      try { chart.removeEntity(id); } catch { /* 旧布局已经移除绘图 */ }
+      return true;
+    };
     const seen = new Set<string>();
     const nowSec = Math.round(Date.now() / 1000);
 
@@ -649,8 +598,8 @@ export function useOrderLines({
         continue;
       }
 
-      if (creatingRef.current.has(key)) continue;   // 防止轮询期间重复创建
-      creatingRef.current.add(key);
+      if (creating.has(key)) continue;   // 防止轮询期间重复创建
+      creating.add(key);
       void (async () => {
         try {
           const id = await chart.createMultipointShape([{ time: nowSec, price }], {
@@ -670,11 +619,13 @@ export function useOrderLines({
               horzLabelsAlign: 'right',
             },
           });
-          lines.set(key, { id, price, time: nowSec, orderType: o.orderType, lastText: label, theme });
+          if (!discardStaleShape(id)) {
+            lines.set(key, { id, price, time: nowSec, orderType: o.orderType, lastText: label, theme });
+          }
         } catch {
           /* 图表未就绪,下轮轮询重试 */
         } finally {
-          creatingRef.current.delete(key);
+          creating.delete(key);
         }
       })();
     }
@@ -702,8 +653,8 @@ export function useOrderLines({
         } catch {
           lines.delete(pkey);
         }
-      } else if (!creatingRef.current.has(pkey)) {
-        creatingRef.current.add(pkey);
+      } else if (!creating.has(pkey)) {
+        creating.add(pkey);
         void (async () => {
           try {
             const id = await chart.createMultipointShape([{ time: nowSec, price: pos.averagePrice }], {
@@ -723,11 +674,13 @@ export function useOrderLines({
                 horzLabelsAlign: 'right',
               },
             });
-            lines.set(pkey, { id, price: pos.averagePrice, time: nowSec, lastText: plabel, theme });
+            if (!discardStaleShape(id)) {
+              lines.set(pkey, { id, price: pos.averagePrice, time: nowSec, lastText: plabel, theme });
+            }
           } catch {
             /* 下轮重试 */
           } finally {
-            creatingRef.current.delete(pkey);
+            creating.delete(pkey);
           }
         })();
       }
@@ -737,22 +690,5 @@ export function useOrderLines({
     for (const key of Array.from(lines.keys())) {
       if (!seen.has(key)) removeLine(key);
     }
-  }, [widget, symbol, account, orders, positions, brackets, tickSize, pointValue, theme]);
-
-  // 组件卸载时清理所有线条
-  useEffect(() => {
-    const lines = linesRef.current;
-    const intentional = intentionalRemoveRef.current;
-    return () => {
-      const w = widgetRef.current as any;
-      let chart: any = null;
-      try { chart = w && w.activeChart(); } catch { chart = null; }
-      if (!chart) return;
-      for (const entry of lines.values()) {
-        intentional.add(String(entry.id));
-        try { chart.removeEntity(entry.id); } catch { /* ignore */ }
-      }
-      lines.clear();
-    };
-  }, []);
+  }, [widget, symbol, account, orders, positions, brackets, tickSize, pointValue, theme, epoch, layoutRevision]);
 }

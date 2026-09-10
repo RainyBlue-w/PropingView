@@ -1,12 +1,11 @@
 import { useState } from 'react';
-import { GripVertical, Pause, Play, StepForward, X } from 'lucide-react';
+import { Pause, Play, StepForward, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { useDraggable } from '@/hooks/useDraggable';
-
-const REPLAY_POS_KEY = 'nt8-terminal-replay-pos';
 
 export interface ReplayBarProps {
+  /** 历史行情源可用时才允许开始回放。 */
+  enabled?: boolean;
   active: boolean;
   /** 回放游标时间(unix 秒) */
   cursor: number;
@@ -25,12 +24,12 @@ export interface ReplayBarProps {
 const SPEEDS = [0.5, 1, 2, 5];
 /** 步长选项:[秒, 显示名] */
 const STEP_OPTIONS: [number, string][] = [
-  [60, '1min'],
-  [300, '5min'],
-  [900, '15min'],
-  [1800, '30min'],
-  [3600, '1h'],
-  [86400, '1D'],
+  [60, '1 分钟'],
+  [300, '5 分钟'],
+  [900, '15 分钟'],
+  [1800, '30 分钟'],
+  [3600, '1 小时'],
+  [86400, '1 天'],
 ];
 
 /** datetime-local 默认值:3 天前 */
@@ -40,12 +39,9 @@ function defaultStartLocal(): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-/**
- * 回放控制条(图表左上浮条):
- * 未激活 = [回放] 按钮 → 起点选择;激活 = 游标时间/单步/播放/速度/退出。
- * 纯受控组件,全部状态在 ChartTerminal。
- */
+/** 回放页内容；回放会话与播放状态由 ChartTerminal 控制。 */
 export default function ReplayBar({
+  enabled = true,
   active,
   cursor,
   playing,
@@ -58,129 +54,129 @@ export default function ReplayBar({
   onStepSecChange,
   onExit,
 }: ReplayBarProps) {
-  const [open, setOpen] = useState(false);
   const [startDraft, setStartDraft] = useState(defaultStartLocal);
-  const drag = useDraggable(REPLAY_POS_KEY);
-  const dragStyle = drag.pos ? { left: drag.pos.x, top: drag.pos.y, right: 'auto' as const } : undefined;
-  const grip = (
-    <span
-      className="cursor-move text-[var(--tv-muted)] hover:text-[var(--tv-text)]"
-      title="按住拖动"
-      onMouseDown={drag.onHandleMouseDown}
-    >
-      <GripVertical className="h-3.5 w-3.5" />
-    </span>
-  );
+  const startSec = Math.floor(new Date(startDraft).getTime() / 1000);
+  const validStart = Number.isFinite(startSec) && startSec > 0;
+  const inputCls =
+    'h-8 w-full min-w-0 rounded-md border border-[var(--tv-border)] bg-[var(--tv-bg)] px-2 text-xs text-[var(--tv-text)]';
 
-  if (!active) {
-    return (
-      <div
-        data-draggable-panel
-        style={dragStyle}
-        className="absolute left-2 top-2 z-50 flex items-center gap-2 rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)]/95 px-2 py-1.5 shadow-lg backdrop-blur"
-      >
-        {grip}
-        {open ? (
-          <>
-            <Input
-              type="datetime-local"
-              value={startDraft}
-              onChange={(e) => setStartDraft(e.target.value)}
-              className="h-7 w-52 border-[var(--tv-border)] bg-[var(--tv-bg)] text-xs text-[var(--tv-text)]"
-            />
+  return (
+    <section className="space-y-4 p-3 text-xs text-[var(--tv-text)]" aria-label="历史回放控制">
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="font-semibold">历史回放</h2>
+        <span className={`rounded px-2 py-0.5 text-[11px] ${
+          active ? 'bg-[#f0b90b]/15 text-[#b88900]' : 'bg-[var(--tv-bg)] text-[var(--tv-muted)]'
+        }`}>
+          {active ? (playing ? '播放中' : '已暂停') : '未开始'}
+        </span>
+      </div>
+
+      {active ? (
+        <div className="rounded-md border border-[#f0b90b]/30 bg-[var(--tv-bg)] p-3">
+          <div className="mb-1 text-[11px] text-[var(--tv-muted)]">当前回放时间（本地时间）</div>
+          <div className="font-mono text-sm tabular-nums">
+            {cursor > 0 ? new Date(cursor * 1000).toLocaleString() : '—'}
+          </div>
+        </div>
+      ) : (
+        <form
+          className="space-y-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (enabled && validStart) onStart(startSec);
+          }}
+        >
+          <label htmlFor="replay-start" className="block text-[11px] text-[var(--tv-muted)]">
+            开始时间（本地时间）
+          </label>
+          <Input
+            id="replay-start"
+            type="datetime-local"
+            required
+            value={startDraft}
+            onChange={(event) => setStartDraft(event.target.value)}
+            className={inputCls}
+          />
+          <Button
+            type="submit"
+            size="sm"
+            disabled={!enabled || !validStart}
+            className="h-8 w-full gap-1.5 bg-[#2962ff] text-xs text-white hover:bg-[#2962ff]/90"
+          >
+            <Play className="h-3.5 w-3.5" />
+            开始回放
+          </Button>
+          {!enabled && (
+            <p className="text-[11px] leading-4 text-[var(--tv-muted)]">连接 NT8 数据桥后可开始回放。</p>
+          )}
+        </form>
+      )}
+
+      <div className="grid grid-cols-2 gap-2">
+        <label className="space-y-1">
+          <span className="block text-[11px] text-[var(--tv-muted)]">推进步长</span>
+          <select
+            value={stepSec}
+            onChange={(event) => onStepSecChange(parseInt(event.target.value, 10))}
+            className={inputCls}
+            title="每次推进的行情时间跨度"
+          >
+            {STEP_OPTIONS.map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+        </label>
+        <label className="space-y-1">
+          <span className="block text-[11px] text-[var(--tv-muted)]">播放速度</span>
+          <select
+            value={speed}
+            onChange={(event) => onSpeedChange(parseFloat(event.target.value))}
+            className={inputCls}
+          >
+            {SPEEDS.map((value) => (
+              <option key={value} value={value}>{value}x</option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      {active && (
+        <div className="space-y-2">
+          <div className="grid grid-cols-2 gap-2">
             <Button
               size="sm"
-              className="h-7 text-xs"
-              onClick={() => {
-                const t = Math.floor(new Date(startDraft).getTime() / 1000);
-                if (t > 0) onStart(t);
-              }}
+              variant="outline"
+              className="h-8 gap-1.5 border-[var(--tv-border)] bg-[var(--tv-bg)] text-xs hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)]"
+              title="按所选步长推进回放"
+              onClick={onStep}
             >
-              开始
+              <StepForward className="h-3.5 w-3.5" />
+              单步推进
             </Button>
-            <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={() => setOpen(false)}>
-              取消
+            <Button
+              size="sm"
+              className="h-8 gap-1.5 bg-[#2962ff] text-xs text-white hover:bg-[#2962ff]/90"
+              onClick={onTogglePlay}
+            >
+              {playing ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+              {playing ? '暂停' : '播放'}
             </Button>
-          </>
-        ) : (
+          </div>
           <Button
             size="sm"
             variant="ghost"
-            className="h-7 text-xs text-[var(--tv-text)]"
-            title="在历史数据上回放并模拟开单"
-            onClick={() => setOpen(true)}
+            className="h-8 w-full gap-1.5 text-xs text-[#ef5350] hover:bg-[#ef5350]/10 hover:text-[#ef5350]"
+            onClick={onExit}
           >
-            回放
+            <X className="h-3.5 w-3.5" />
+            保存并返回会话列表
           </Button>
-        )}
-      </div>
-    );
-  }
+        </div>
+      )}
 
-  return (
-    <div
-      data-draggable-panel
-      style={dragStyle}
-      className="absolute left-2 top-2 z-50 flex items-center gap-1.5 rounded-md border border-[#f0b90b]/40 bg-[var(--tv-panel)]/95 px-2 py-1.5 text-xs text-[var(--tv-text)] shadow-lg backdrop-blur"
-    >
-      {grip}
-      <span className="mr-1 rounded bg-[#f0b90b]/15 px-1.5 py-0.5 font-semibold text-[#f0b90b]">
-        回放中
-      </span>
-      <span className="font-mono text-[var(--tv-muted)]">
-        {cursor > 0 ? new Date(cursor * 1000).toLocaleString() : '—'}
-      </span>
-      <Button
-        size="sm"
-        variant="ghost"
-        className="h-7 px-2 text-xs"
-        title="前进一根 K 线"
-        onClick={onStep}
-      >
-        <StepForward className="h-3.5 w-3.5" />
-      </Button>
-      <Button
-        size="sm"
-        variant="ghost"
-        className="h-7 px-2 text-xs"
-        title={playing ? '暂停' : '播放'}
-        onClick={onTogglePlay}
-      >
-        {playing ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
-      </Button>
-      <select
-        value={stepSec}
-        onChange={(e) => onStepSecChange(parseInt(e.target.value, 10))}
-        className="h-7 rounded border border-[var(--tv-border)] bg-[var(--tv-bg)] px-1 text-xs text-[var(--tv-text)]"
-        title="步长:每次推进的行情时间跨度"
-      >
-        {STEP_OPTIONS.map(([v, label]) => (
-          <option key={v} value={v}>
-            {label}
-          </option>
-        ))}
-      </select>
-      <select
-        value={speed}
-        onChange={(e) => onSpeedChange(parseFloat(e.target.value))}
-        className="h-7 rounded border border-[var(--tv-border)] bg-[var(--tv-bg)] px-1 text-xs text-[var(--tv-text)]"
-        title="播放速度"
-      >
-        {SPEEDS.map((s) => (
-          <option key={s} value={s}>
-            {s}x
-          </option>
-        ))}
-      </select>
-      <Button
-        size="sm"
-        variant="ghost"
-        className="h-7 px-2 text-xs text-[#ef5350]"
-        title="退出回放,恢复实盘"
-        onClick={onExit}
-      >
-        <X className="h-3.5 w-3.5" />
-      </Button>
-    </div>
+      <p className="text-[11px] leading-5 text-[var(--tv-muted)]">
+        按所选步长推进历史行情，休市时自动跳到下一段行情。下方交易面板使用本会话的模拟账户。
+      </p>
+    </section>
   );
 }

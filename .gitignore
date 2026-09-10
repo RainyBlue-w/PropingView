@@ -8,6 +8,8 @@ app/dist/
 
 # 第三方图表库源码副本(自带独立 .git 仓库,不进主仓库)
 charting_library-master/
+charting_library_v29.4/
+charting_library_v32.1/
 
 # 打包产物(pack.bat 可重新生成)
 NT8Terminal-package.zip

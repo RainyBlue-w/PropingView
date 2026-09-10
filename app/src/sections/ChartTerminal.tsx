@@ -1,17 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { GripVertical, History, Moon, RefreshCw, Settings, Sun, X } from 'lucide-react';
+import { Columns2, Grid2X2, GripVertical, History, Moon, PanelRight, RefreshCw, Settings, Square, Sun, Wallet, X } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import TvAdvancedChart from '@/components/TvAdvancedChart';
+import ChartWorkspace, { type ChartWorkspaceHandle } from '@/components/ChartWorkspace';
 import SymbolFavorites from '@/components/SymbolFavorites';
 import TradingPanel, { type OrderKind } from '@/sections/TradingPanel';
+import AccountPages from '@/sections/AccountPages';
 import ReplayBar from '@/sections/ReplayBar';
-import { useOrderLines } from '@/hooks/useOrderLines';
+import ReplayDashboard from '@/sections/ReplayDashboard';
+import { createReplaySession, deleteReplaySession, loadReplaySessions, saveReplaySession, type ReplaySession as SavedReplaySession, type NewReplaySessionInput } from '@/lib/replayStore';
+import { startHistorySync } from '@/lib/historyStore';
+import { rememberTradeAccounts } from '@/lib/tradeHistoryFilters';
 import { useDraftLines } from '@/hooks/useDraftLines';
-import { useExecutionTrades } from '@/hooks/useExecutionTrades';
 import { useDraggable } from '@/hooks/useDraggable';
-import { detectOrderType, resolvePointValue, roundToTick, tickDecimals, type DraftSide } from '@/lib/draftCalc';
+import { resolvePointValue, roundToTick, type DraftSide } from '@/lib/draftCalc';
 import { getBridgeUrl, setBridgeUrl, DEFAULT_BRIDGE_URL_DISPLAY } from '@/lib/config';
 import { createMockAdapter } from '@/lib/mockFeed';
 import { checkNt8Status, createNt8Adapter, type Nt8Status } from '@/lib/nt8Bridge';
@@ -20,7 +23,7 @@ import { ReplaySession } from '@/lib/replaySession';
 import { SimTrading, SIM_ACCOUNT } from '@/lib/simTrading';
 import { setTradingBackend, trading } from '@/lib/tradingRouter';
 import { TvDatafeed } from '@/lib/tvDatafeed';
-import type { FeedAdapter } from '@/types/market';
+import type { FeedAdapter, SymbolInfo } from '@/types/market';
 
 type FeedStatus = 'connecting' | 'nt8' | 'mock';
 
@@ -40,7 +43,7 @@ const ACCOUNT_KEY = 'nt8-terminal-account';
 const PANEL_WIDTH_KEY = 'nt8-terminal-panel-width';
 const THEME_KEY = 'nt8-terminal-theme';
 const SETTINGS_POS_KEY = 'nt8-terminal-settings-pos';
-const STATUS_POS_KEY = 'nt8-terminal-status-pos';
+const SYMBOL_SEARCH_POS_KEY = 'nt8-terminal-symbol-search-pos';
 const REPLAY_STEP_KEY = 'nt8-terminal-replay-step';
 /** 回放步长选项(秒):1/5/15/30 分钟、1 小时、1 天 */
 const REPLAY_STEP_OPTIONS = [60, 300, 900, 1800, 3600, 86400];
@@ -49,9 +52,31 @@ const SYMBOL_KEY = 'nt8-terminal-symbol';
 const INTERVAL_KEY = 'nt8-terminal-interval';
 const QTY_KEY = 'nt8-terminal-qty';
 const KIND_KEY = 'nt8-terminal-kind';
+const CHART_COUNT_KEY = 'nt8-terminal-chart-count';
+const TRADING_PANEL_KEY = 'nt8-terminal-trading-panel-open';
+const ACCOUNT_PANEL_KEY = 'nt8-terminal-account-panel-open';
+
+function panelIsOpen(key: string): boolean {
+  try { return localStorage.getItem(key) !== '0'; } catch { return true; }
+}
 
 export default function ChartTerminal() {
+  const [page, setPage] = useState<'chart' | 'overview' | 'records' | 'replay'>('chart');
   const [datafeed] = useState(() => new TvDatafeed(createMockAdapter()));
+  const [feedGeneration, setFeedGeneration] = useState(0);
+  const [chartCount, setChartCount] = useState<1 | 2 | 4>(() => {
+    try { const value = Number(localStorage.getItem(CHART_COUNT_KEY)); return value === 2 || value === 4 ? value : 1; }
+    catch { return 1; }
+  });
+  const [showTradingPanel, setShowTradingPanel] = useState(() => panelIsOpen(TRADING_PANEL_KEY));
+  const [showAccountPanel, setShowAccountPanel] = useState(() => panelIsOpen(ACCOUNT_PANEL_KEY));
+  useEffect(() => {
+    try {
+      localStorage.setItem(CHART_COUNT_KEY, String(chartCount));
+      localStorage.setItem(TRADING_PANEL_KEY, showTradingPanel ? '1' : '0');
+      localStorage.setItem(ACCOUNT_PANEL_KEY, showAccountPanel ? '1' : '0');
+    } catch { /* Preferences remain usable without browser storage. */ }
+  }, [chartCount, showTradingPanel, showAccountPanel]);
   const [status, setStatus] = useState<FeedStatus>('connecting');
   const [nt8Info, setNt8Info] = useState<Nt8Status | null>(null);
   const [defaultSymbol, setDefaultSymbol] = useState<string>(() => {
@@ -71,14 +96,16 @@ export default function ChartTerminal() {
     try { return localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark'; } catch { return 'dark'; }
   });
 
-  // ---- 浮窗拖拽(设置浮窗 + 状态面板;位置记忆,useDraggable 统一实现) ----
+  // ---- 合约搜索与设置位置；常用工具固定在页面右上角 ----
   const settingsDrag = useDraggable(SETTINGS_POS_KEY);
-  const statusDrag = useDraggable(STATUS_POS_KEY);
+  const symbolSearchDrag = useDraggable(SYMBOL_SEARCH_POS_KEY);
 
   // ---- 交易状态 ----
   const [widget, setWidget] = useState<TradingViewWidget | null>(null);
   /** widget 的 ref 镜像:onAdapterSwapped 等"只注册一次"的回调闭包会捕获到过期的 state,必须用 ref 取 */
   const widgetRef = useRef<TradingViewWidget | null>(null);
+  const workspaceRef = useRef<ChartWorkspaceHandle | null>(null);
+  const unbindActiveWidget = useRef<() => void>(() => {});
   /** 订单成交/持仓签名:变化时刷新图表交易历史箭头 */
   const tradeSigRef = useRef('');
   const [tradeSig, setTradeSig] = useState('');
@@ -87,6 +114,11 @@ export default function ChartTerminal() {
   const [chartEpoch, setChartEpoch] = useState(0);
   const [tickSize, setTickSize] = useState(0.25);
   const [accounts, setAccounts] = useState<Nt8Account[]>([]);
+  const [liveAccounts, setLiveAccounts] = useState<Nt8Account[]>([]);
+  const [liveAccountsError, setLiveAccountsError] = useState<string | null>(null);
+  const [knownSymbols, setKnownSymbols] = useState<SymbolInfo[]>([]);
+  const knownSymbolsRef = useRef(knownSymbols);
+  knownSymbolsRef.current = knownSymbols;
   const [account, setAccount] = useState(() => {
     try { return localStorage.getItem(ACCOUNT_KEY) || ''; } catch { return ''; }
   });
@@ -119,9 +151,23 @@ export default function ChartTerminal() {
   const [panelWidth, setPanelWidth] = useState(() => {
     try { return parseInt(localStorage.getItem(PANEL_WIDTH_KEY) || '', 10) || 400; } catch { return 400; }
   });
-  const dragState = useRef<{ startX: number; startWidth: number } | null>(null);
+  const dragState = useRef<{ startX: number; startWidth: number; width: number } | null>(null);
 
-  // ---- 历史回放 + 模拟交易(回放状态刻意不进 localStorage,刷新即回实盘) ----
+  // ---- 回放会话：完整快照持久化，刷新后从 dashboard 选择继续。 ----
+  const [savedReplayData] = useState(loadReplaySessions);
+  const [replaySessions, setReplaySessions] = useState(savedReplayData.sessions);
+  const [replayStorageError, setReplayStorageError] = useState<string | null>(savedReplayData.errors.join('；') || null);
+  const [replayOperationError, setReplayOperationError] = useState<string | null>(null);
+  const replayRecordRef = useRef<SavedReplaySession | null>(null);
+  const simRef = useRef<SimTrading | null>(null);
+  const saveReplayRef = useRef<() => boolean>(() => true);
+  const stepInFlight = useRef<Promise<boolean> | null>(null);
+  const replayDispatching = useRef(false);
+  const replayTransition = useRef(false);
+  const navigationGeneration = useRef(0);
+  const currentIntervalRef = useRef(initialInterval);
+  const [widgetInterval, setWidgetInterval] = useState(initialInterval);
+  const previousChartRef = useRef({ symbol: defaultSymbol, interval: initialInterval });
   const [replayActive, setReplayActive] = useState(false);
   const [replayCursor, setReplayCursor] = useState(0);
   const [replayPlaying, setReplayPlaying] = useState(false);
@@ -140,6 +186,30 @@ export default function ChartTerminal() {
   const sessionRef = useRef<ReplaySession | null>(null);
   /** 进入回放前的真实账户,退出时恢复 */
   const prevAccountRef = useRef('');
+
+  useEffect(() => startHistorySync(), []);
+
+  // 总览始终显示全部 NT8 账户，不受模拟后端或交易面板选中账户影响。
+  const refreshLiveAccounts = useCallback(async () => {
+    try {
+      const result = await nt8Trading.getAccounts();
+      setLiveAccounts(result.accounts);
+      rememberTradeAccounts(result.accounts);
+      setLiveAccountsError(null);
+    } catch (err) {
+      setLiveAccountsError(err instanceof Error ? err.message : '账户读取失败');
+    }
+  }, []);
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      await refreshLiveAccounts();
+      if (!stopped) timer = setTimeout(poll, 3000);
+    };
+    void poll();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [refreshLiveAccounts]);
 
   // ---- 隐藏账户(账户页眼睛开关;localStorage 记忆) ----
   // (位置需在 connect 之前:connect/refreshTrading 引用 pruneHiddenAccounts,块级声明不能前向引用)
@@ -170,23 +240,35 @@ export default function ChartTerminal() {
   }, []);
 
   const connect = useCallback(async () => {
+    try { await workspaceRef.current?.saveLayouts(); }
+    catch (error) { window.alert(error instanceof Error ? error.message : '图表布局保存失败'); return; }
+    navigationGeneration.current++;
     // 重连前先退出回放:后端与数据适配器都要重建
     if (sessionRef.current) {
+      setReplayPlaying(false);
+      await stepInFlight.current?.catch(() => false);
+      if (!saveReplayRef.current()) return;
       sessionRef.current = null;
+      simRef.current = null;
+      replayRecordRef.current = null;
+      widgetRef.current = null;
+      setWidget(null);
       setTradingBackend(null);
       setReplayActive(false);
-      setReplayPlaying(false);
+      setAccount(prevAccountRef.current);
+      setDefaultSymbol(previousChartRef.current.symbol);
+      setWidgetInterval(previousChartRef.current.interval);
     }
     setStatus('connecting');
     setSymbolsEmpty(false);
     const st = await checkNt8Status();
     setNt8Info(st);
-    const adapter = st ? createNt8Adapter() : createMockAdapter();
+    const adapter = st ? createNt8Adapter(st) : createMockAdapter();
     adapterRef.current = adapter;
     datafeed.setAdapter(adapter);
-    setStatus(st ? 'nt8' : 'mock');
     try {
       const symbols = await datafeed.listSymbols();
+      setKnownSymbols(symbols);
       if (symbols.length === 0 && st) setSymbolsEmpty(true);
       setTickSize(
         symbols.find((s) => s.symbol === chartSymbol)?.tickSize ??
@@ -208,10 +290,12 @@ export default function ChartTerminal() {
     } catch {
       /* 保留当前默认合约 */
     }
+    setStatus(st ? 'nt8' : 'mock');
     if (st) {
       try {
         const { accounts: accs } = await nt8Trading.getAccounts();
         setAccounts(accs);
+        setLiveAccounts(accs);
         pruneHiddenAccounts(accs);
         setAccount((cur) =>
           cur && accs.some((a) => a.name === cur) ? cur : accs[0]?.name ?? '',
@@ -225,22 +309,27 @@ export default function ChartTerminal() {
 
   useEffect(() => {
     datafeed.onAdapterSwapped = () => {
-      // 注意用 widgetRef:本 effect 只在挂载时跑一次,闭包里的 widget state 永远是 null
-      const w = widgetRef.current;
-      if (w) w.onChartReady(() => {
-        const chart = w.activeChart() as unknown as { resetCache?: () => void; resetData: () => void };
-        // 库会按请求参数缓存 datafeed 响应:必须先 resetCache 再 resetData,
-        // 否则换 adapter 后吃到的是旧缓存(表现为 resetData 后完全没有新请求)
-        try { chart.resetCache?.(); } catch { /* ignore */ }
-        chart.resetData();
-      });
+      // A swapped adapter invalidates every chart, including nonselected panes and their subscriptions.
+      unbindActiveWidget.current();
+      widgetRef.current = null;
+      setWidget(null);
+      setFeedGeneration(value => value + 1);
     };
     void connect();
+    return () => { datafeed.onAdapterSwapped = null; unbindActiveWidget.current(); };
   }, [connect, datafeed]);
 
   // ---- 交易数据轮询(0.5 秒;桥端是轻量快照,直连本地开销极低;回放期间走模拟引擎) ----
+  const pollContext = `${status}|${account}|${replayActive}`;
+  const pollContextRef = useRef(pollContext);
+  pollContextRef.current = pollContext;
+  const pollInFlight = useRef<string | null>(null);
   const refreshTrading = useCallback(async () => {
     if ((status !== 'nt8' && !sessionRef.current) || !account) return;
+    const context = pollContext;
+    if (pollContextRef.current !== context) return;
+    if (pollInFlight.current === context) return;
+    pollInFlight.current = context;
     try {
       // brackets 端点依赖桥端升级(F5);未升级时单独容错,不拖垮订单/持仓轮询
       const [{ positions: p }, { orders: o }, bracketsRes, accsRes] = await Promise.all([
@@ -250,6 +339,7 @@ export default function ChartTerminal() {
         // 账户余额/盈亏(账户信息页用);失败不影响其他数据
         trading.getAccounts().catch(() => null),
       ]);
+      if (pollContextRef.current !== context) return;
       setPositions(p);
       setOrders(o);
       if (bracketsRes) setBrackets(bracketsRes.brackets);
@@ -266,12 +356,15 @@ export default function ChartTerminal() {
         tradeSigRef.current = sig;
         setTradeSig(sig);
       }
-      setPollError(null);
+      setPollError(bracketsRes?.syncError || null);
     } catch (err) {
+      if (pollContextRef.current !== context) return;
       /* 轮询失败保持旧数据,但在面板上提示,避免"持仓不显示"无从下手 */
       setPollError(err instanceof Error ? err.message : '桥连接失败');
+    } finally {
+      if (pollInFlight.current === context) pollInFlight.current = null;
     }
-  }, [status, account, pruneHiddenAccounts]);
+  }, [status, account, pruneHiddenAccounts, pollContext]);
 
   useEffect(() => {
     if ((status !== 'nt8' && !replayActive) || !account) return;
@@ -285,52 +378,153 @@ export default function ChartTerminal() {
   // 实测本版库 resetData 不会重拉数据(实现为 mainSeries().rerequestData(),
   // 且 d.ts 声称的 resetCache 在运行时不存在);重建 widget 干净利落,
   // 图上绘图由各 hook 从状态重建
-  const exitReplay = useCallback(() => {
-    sessionRef.current = null;
-    setTradingBackend(null);
+  const saveCurrentReplay = useCallback(() => {
+    const record = replayRecordRef.current;
+    const sim = simRef.current;
+    const session = sessionRef.current;
+    if (!record || !sim || !session) return true;
+    const state = sim.exportState();
+    const lastPrices = { ...record.lastPrices };
+    for (const symbol of new Set([record.symbol, ...state.positions.map(p => p.instrument)])) {
+      const price = datafeed.getLastPrice(symbol);
+      if (price != null) lastPrices[symbol] = price;
+    }
+    const next = { ...record, state, lastPrices, cursor: session.getCursor(), updatedAt: Date.now() };
+    replayRecordRef.current = next;
+    setReplaySessions(rows => [next, ...rows.filter(r => r.id !== next.id)]);
+    try {
+      saveReplaySession(next);
+      setReplayStorageError(null);
+      return true;
+    } catch (err) {
+      setReplayPlaying(false);
+      setReplayStorageError(err instanceof Error ? err.message : '回放会话保存失败');
+      return false;
+    }
+  }, [datafeed]);
+  saveReplayRef.current = saveCurrentReplay;
+
+  useEffect(() => {
+    const save = () => { saveReplayRef.current(); };
+    window.addEventListener('pagehide', save);
+    return () => window.removeEventListener('pagehide', save);
+  }, []);
+
+  const exitReplay = useCallback(async (): Promise<boolean> => {
     setReplayPlaying(false);
+    await stepInFlight.current?.catch(() => false);
+    if (!saveReplayRef.current()) return false;
+    sessionRef.current = null;
+    simRef.current = null;
+    replayRecordRef.current = null;
+    widgetRef.current = null;
+    setTradingBackend(null);
     setWidget(null);
     if (adapterRef.current) datafeed.setAdapter(adapterRef.current);
     setReplayActive(false);
     setAccount((cur) => (cur === SIM_ACCOUNT ? prevAccountRef.current : cur));
-  }, [datafeed]);
+    setAccounts(liveAccounts);
+    setPositions([]); setOrders([]); setBrackets([]);
+    setDefaultSymbol(previousChartRef.current.symbol);
+    setWidgetInterval(previousChartRef.current.interval);
+    currentIntervalRef.current = previousChartRef.current.interval;
+    return true;
+  }, [datafeed, liveAccounts]);
 
-  const enterReplay = useCallback(
-    (startSec: number) => {
+  const resumeReplay = useCallback(
+    async (record: SavedReplaySession) => {
       const base = adapterRef.current;
-      if (!base || !widget || sessionRef.current) return;
-      const session = new ReplaySession(base, startSec);
+      if (!base || status !== 'nt8') throw new Error('连接 NT8 数据桥后可加载历史行情。');
+      if (sessionRef.current || replayTransition.current) return;
+      replayTransition.current = true;
+      const generation = navigationGeneration.current;
+      setReplayOperationError(null);
+      try {
+      await workspaceRef.current?.saveLayouts();
+      const info = knownSymbols.find(s => s.symbol === record.symbol) ?? await base.resolve?.(record.symbol);
+      if (generation !== navigationGeneration.current || adapterRef.current !== base) return;
+      if (!info) throw new Error('未找到此会话的合约，请检查 NT8 合约与行情连接。');
+      const session = new ReplaySession(base, record.cursor);
+      record = { ...record, pointValues: { ...record.pointValues, [record.symbol]: resolvePointValue(record.symbol, info.pointValue) } };
+      replayRecordRef.current = record;
       const sim = new SimTrading({
         getLastPrice: (s) => datafeed.getLastPrice(s),
-        pointValueOf: (s) => (s === chartSymbol ? pointValue : resolvePointValue(s)),
+        pointValueOf: (s) => replayRecordRef.current?.pointValues[s] ?? resolvePointValue(s),
         getCursorTime: () => session.getCursor(),
-      });
+        onChange: () => { if (sessionRef.current === session && !replayDispatching.current) saveReplayRef.current(); },
+      }, { initialEquity: record.initialEquity, state: record.state });
       session.onBarRevealed((sym, _intervalSec, bar) => {
-        sim.onBar(sym, bar);
+        if (sessionRef.current !== session) return;
+        replayDispatching.current = true;
+        try { sim.onBar(sym, bar); } finally { replayDispatching.current = false; }
         setReplayCursor(session.getCursor());
       });
       sessionRef.current = session;
+      simRef.current = sim;
       setTradingBackend(sim);
       prevAccountRef.current = account;
+      previousChartRef.current = { symbol: chartSymbol || defaultSymbol, interval: currentIntervalRef.current };
       setAccount(SIM_ACCOUNT);
-      setReplayCursor(startSec);
+      setPositions([]); setOrders([]); setBrackets([]); setAccounts([]);
+      setReplayCursor(record.cursor);
+      setReplaySpeed(record.speed);
+      setReplayStepSec(record.stepSec);
+      setDefaultSymbol(record.symbol);
+      setWidgetInterval(record.interval);
+      currentIntervalRef.current = record.interval;
+      widgetRef.current = null;
       setWidget(null);
-      rpTrace('ui.enterReplay', { startSec });
+      rpTrace('ui.enterReplay', { id: record.id, cursor: record.cursor });
       datafeed.setAdapter(session); // 先切适配器,再翻转 key 重建图表(直接在回放数据上初始化)
       setReplayPlaying(false);
       setReplayActive(true);
+      setPage('replay');
+      saveReplayRef.current();
+      } finally { replayTransition.current = false; }
     },
-    [widget, datafeed, chartSymbol, pointValue, account],
+    [datafeed, chartSymbol, defaultSymbol, account, knownSymbols, status],
   );
+
+  const newReplay = useCallback(async (input: NewReplaySessionInput) => {
+    const record = createReplaySession(input);
+    saveReplaySession(record);
+    setReplaySessions(rows => [record, ...rows]);
+    await resumeReplay(record);
+  }, [resumeReplay]);
+
+  const removeReplay = useCallback((id: string) => {
+    if (replayRecordRef.current?.id === id || replayTransition.current) {
+      throw new Error('请先保存并退出当前回放，再删除会话。');
+    }
+    // 本地删除成功后再更新列表；当前回放的保存回调不能重新写回已删会话。
+    deleteReplaySession(id);
+    setReplaySessions(rows => rows.filter(session => session.id !== id));
+  }, []);
+
+  const enterReplay = useCallback((startTime: number) => newReplay({
+    name: `${chartSymbol || defaultSymbol} 回放`, symbol: chartSymbol || defaultSymbol, startTime, initialEquity: 100000,
+  }), [newReplay, chartSymbol, defaultSymbol]);
 
   const stepReplayAsync = useCallback((): Promise<boolean> => {
     const s = sessionRef.current;
     rpTrace('ui.step', { hasSession: !!s, stepSec: stepSecRef.current });
     if (!s) return Promise.resolve(false);
-    return s.step(stepSecRef.current).then((ok) => {
-      if (!ok) setReplayPlaying(false); // 到数据尽头自动停播
+    if (stepInFlight.current) return stepInFlight.current;
+    const task = s.step(stepSecRef.current).then((ok) => {
+      if (sessionRef.current !== s) return false;
+      setReplayCursor(s.getCursor());
+      if (!ok) setReplayPlaying(false);
       return ok;
+    }).catch(err => {
+      setReplayPlaying(false);
+      setReplayOperationError(err instanceof Error ? err.message : '回放推进失败');
+      return false;
+    }).finally(() => {
+      stepInFlight.current = null;
+      if (sessionRef.current === s) saveReplayRef.current();
     });
+    stepInFlight.current = task;
+    return task;
   }, []);
 
   /** stepReplayAsync 里读步长:ref 镜像保证播放定时器闭包拿到的是最新值 */
@@ -378,34 +572,84 @@ export default function ChartTerminal() {
 
   // ---- widget 图表就绪后再暴露给订单线等逻辑,并追踪合约变化 ----
   const handleWidgetReady = useCallback((w: TradingViewWidget) => {
+    if (widgetRef.current === w) return;
+    unbindActiveWidget.current();
     widgetRef.current = w;
-    w.onChartReady(() => {
+    (window as unknown as Record<string, unknown>).__lastWidget = w;
+    // A draft belongs to the selected chart; switching panes starts a fresh ticket.
+    setMode('trade');
+    setLimitPrice('');
+    setTpAmount('');
+    setSlAmount('');
+    setRefPrice(null);
+    let unsubscribeChart = () => {};
+    let initialized = false;
+    let boundSymbol = '';
+    const bindChart = () => {
+      if (widgetRef.current !== w) return;
+      unsubscribeChart();
       setWidget(w);
       const chart = w.activeChart();
-      setChartSymbol(chart.symbol());
-      chart.onSymbolChanged().subscribe(null, () => {
-        setChartSymbol(chart.symbol());
-      });
+      // 实盘恢复布局自身的合约；回放仍固定到当前会话的合约。
+      const cachedSymbol = replayRecordRef.current?.symbol;
+      if (cachedSymbol && chart.symbol() !== cachedSymbol) {
+        try { chart.setSymbol(cachedSymbol); } catch { /* 解析失败保持原样 */ }
+      }
+      const syncSymbol = () => {
+        const record = replayRecordRef.current;
+        if (record && chart.symbol() !== record.symbol) {
+          chart.setSymbol(record.symbol);
+          return;
+        }
+        const nextSymbol = chart.symbol();
+        setChartSymbol(nextSymbol);
+        const info = knownSymbolsRef.current.find(s => s.symbol === nextSymbol);
+        setTickSize(info?.tickSize || 0.25);
+        setPointValue(resolvePointValue(nextSymbol, info?.pointValue));
+        if (boundSymbol && boundSymbol !== nextSymbol) {
+          setLimitPrice('');
+          setTpAmount('');
+          setSlAmount('');
+          setRefPrice(null);
+        }
+        boundSymbol = nextSymbol;
+      };
       // 界面缓存:周期变化即记忆,下次启动恢复
-      // (注意:本版库没有 chart.interval(),只能从事件参数取)
-      chart.onIntervalChanged().subscribe(null, (interval: string) => {
-        try { localStorage.setItem(INTERVAL_KEY, interval); } catch { /* ignore */ }
+      const syncInterval = (interval: string) => {
+        currentIntervalRef.current = interval;
+        if (replayRecordRef.current) {
+          replayRecordRef.current.interval = interval;
+          if (!stepInFlight.current) saveReplayRef.current();
+        } else try { localStorage.setItem(INTERVAL_KEY, interval); } catch { /* ignore */ }
         // 周期纪元 +1:草稿虚线整体重建,避免库在切周期时残留旧线
         setChartEpoch((n) => n + 1);
-      });
-      // 默认指标:EMA20(图表上没有任何指标时才加,避免重复)
-      try {
-        const studies = (chart as any).getAllStudies ? (chart as any).getAllStudies() : [];
-        if (!studies || studies.length === 0) {
-          void (chart as any).createStudy('Moving Average Exponential', false, false, { length: 20 });
-        }
-      } catch { /* 指标加载失败不影响主流程 */ }
-    });
+      };
+      const symbolEvent = chart.onSymbolChanged();
+      const intervalEvent = chart.onIntervalChanged();
+      symbolEvent.subscribe(null, syncSymbol);
+      intervalEvent.subscribe(null, syncInterval);
+      unsubscribeChart = () => {
+        symbolEvent.unsubscribe?.(null, syncSymbol);
+        intervalEvent.unsubscribe?.(null, syncInterval);
+      };
+      // 原生加载会重建主图模型，必须重绑订阅并刷新未参与布局保存的交易线。
+      syncSymbol();
+      syncInterval(chart.resolution());
+      initialized = true;
+    };
+    const onLoaded = () => { if (initialized) bindChart(); };
+    w.onChartReady(bindChart);
+    w.subscribe?.('chart_loaded', onLoaded);
+    unbindActiveWidget.current = () => {
+      unsubscribeChart();
+      try { w.unsubscribe?.('chart_loaded', onLoaded); } catch { /* The previous widget may already be removed. */ }
+      unbindActiveWidget.current = () => {};
+    };
   }, []);
 
   // ---- 界面缓存:合约/单类型/手数 变化即写 localStorage ----
   useEffect(() => {
-    if (chartSymbol) try { localStorage.setItem(SYMBOL_KEY, chartSymbol); } catch { /* ignore */ }
+    if (chartSymbol && !sessionRef.current) try { localStorage.setItem(SYMBOL_KEY, chartSymbol); } catch { /* ignore */ }
   }, [chartSymbol]);
   useEffect(() => {
     try { localStorage.setItem(KIND_KEY, kind); } catch { /* ignore */ }
@@ -418,19 +662,20 @@ export default function ChartTerminal() {
   useEffect(() => {
     document.documentElement.classList.toggle('theme-light', theme === 'light');
     try { localStorage.setItem(THEME_KEY, theme); } catch { /* ignore */ }
-    if (widget) {
-      try { void (widget as any).changeTheme(theme); } catch { /* ignore */ }
-    }
-  }, [theme, widget]);
+  }, [theme]);
 
   // 合约切换后同步 tickSize / pointValue
   useEffect(() => {
     if (!chartSymbol) return;
+    let cancelled = false;
     void datafeed.listSymbols().then((symbols) => {
+      if (cancelled) return;
       const found = symbols.find((s) => s.symbol === chartSymbol);
       if (found?.tickSize) setTickSize(found.tickSize);
       setPointValue(resolvePointValue(chartSymbol, found?.pointValue));
-    });
+      if (replayRecordRef.current) replayRecordRef.current.pointValues[chartSymbol] = resolvePointValue(chartSymbol, found?.pointValue);
+    }).catch(() => { /* Keep the metadata from the last successful symbol list. */ });
+    return () => { cancelled = true; };
   }, [chartSymbol, datafeed]);
 
   // ---- 图表订单线 ----
@@ -438,26 +683,6 @@ export default function ChartTerminal() {
     () => datafeed.getLastPrice(chartSymbol),
     [datafeed, chartSymbol],
   );
-  const subscribePrice = useCallback(
-    (fn: (symbol: string, price: number) => void) => datafeed.onPriceChange(fn),
-    [datafeed],
-  );
-
-  useOrderLines({
-    widget,
-    symbol: chartSymbol,
-    account,
-    orders,
-    positions,
-    brackets,
-    tickSize,
-    pointValue,
-    getLastPrice: getMarketPrice,
-    subscribePrice,
-    theme,
-    onChanged: refreshTrading,
-  });
-
   /** 图表交易历史(成交箭头/盈亏连线)显示开关,默认开 */
   const [showTradeHistory, setShowTradeHistory] = useState(
     () => localStorage.getItem('nt8-terminal-show-trades') !== '0',
@@ -473,52 +698,7 @@ export default function ChartTerminal() {
     });
   }, []);
 
-  // ---- 图表交易历史(linetool 箭头 + FIFO 盈亏连线) ----
-  useExecutionTrades({
-    widget,
-    symbol: chartSymbol,
-    account: status === 'nt8' || replayActive ? account : '',
-    pointValue,
-    refreshKey: tradeSig,
-    enabled: showTradeHistory,
-  });
-
-  // ---- 右键下单:在图表上右键,按右击价位挂限价/止损单(手数取面板;回放时进模拟引擎) ----
-  const ctxRef = useRef({ status, account, chartSymbol, tickSize, qty, refreshTrading, replayActive });
-  ctxRef.current = { status, account, chartSymbol, tickSize, qty, refreshTrading, replayActive };
-  useEffect(() => {
-    if (!widget) return;
-    widget.onContextMenu((_unixtime: number, price: number) => {
-      const { status: st, account: acc, chartSymbol: sym, tickSize: tick, qty: q, replayActive: rp } = ctxRef.current;
-      if ((st !== 'nt8' && !rp) || !acc || !sym || !(price > 0)) return [];
-      const p = roundToTick(price, tick);
-      const label = p.toFixed(tickDecimals(tick));
-      // 智能判定:右击价低于市价的买单=限价、高于=止损;卖单相反(无市价兜底限价)
-      const market = datafeed.getLastPrice(sym);
-      const buyKind = detectOrderType('BUY', p, market);
-      const sellKind = detectOrderType('SELL', p, market);
-      const kindText = (k: 'LIMIT' | 'STOPMARKET') => (k === 'LIMIT' ? '限价' : '止损');
-      const place = (action: 'BUY' | 'SELL', kindName: 'LIMIT' | 'STOPMARKET') => () => {
-        void trading
-          .placeOrder({
-            account: acc,
-            symbol: sym,
-            action,
-            orderType: kindName,
-            quantity: q,
-            limitPrice: kindName === 'LIMIT' ? p : undefined,
-            stopPrice: kindName === 'STOPMARKET' ? p : undefined,
-          })
-          .then(() => ctxRef.current.refreshTrading())
-          .catch((err) => window.alert(err instanceof Error ? err.message : '下单失败'));
-      };
-      return [
-        { position: 'top' as const, text: `买入${kindText(buyKind)} @ ${label} ×${q}`, click: place('BUY', buyKind) },
-        { position: 'top' as const, text: `卖出${kindText(sellKind)} @ ${label} ×${q}`, click: place('SELL', sellKind) },
-        { text: '-', position: 'top' as const },
-      ];
-    });
-  }, [widget, datafeed]);
+  // Order lines, fills and context menus are owned by each ChartWorkspace pane.
 
   // ---- 草稿模式:基准价(MKT 冻结最新价;LMT/STP 用输入的入场价,实时跟随输入) ----
   useEffect(() => {
@@ -585,7 +765,11 @@ export default function ChartTerminal() {
 
   const handleAccountChange = useCallback((name: string) => {
     setAccount(name);
-    try { localStorage.setItem(ACCOUNT_KEY, name); } catch { /* ignore */ }
+    setPositions([]);
+    setOrders([]);
+    setBrackets([]);
+    setPollError(null);
+    if (!sessionRef.current) try { localStorage.setItem(ACCOUNT_KEY, name); } catch { /* ignore */ }
   }, []);
 
   // 当前账户被隐藏时,自动切到第一个可见账户(隐藏账户不可选中)
@@ -598,110 +782,85 @@ export default function ChartTerminal() {
 
   // ---- 分隔条拖拽 ----
   const onDividerDown = useCallback(
-    (e: React.MouseEvent) => {
+    (e: React.PointerEvent<HTMLDivElement>) => {
       e.preventDefault();
-      dragState.current = { startX: e.clientX, startWidth: panelWidth };
-      const onMove = (ev: MouseEvent) => {
+      const divider = e.currentTarget;
+      divider.setPointerCapture(e.pointerId);
+      const columns = Math.max(1, Number(showTradingPanel) + Number(showAccountPanel));
+      dragState.current = { startX: e.clientX, startWidth: panelWidth, width: panelWidth };
+      const onMove = (ev: PointerEvent) => {
         if (!dragState.current) return;
         const delta = dragState.current.startX - ev.clientX;
-        const w = Math.min(640, Math.max(280, dragState.current.startWidth + delta));
+        const w = Math.min(640, Math.max(260, dragState.current.startWidth + delta / columns));
+        dragState.current.width = w;
         setPanelWidth(w);
       };
       const onUp = () => {
         if (dragState.current) {
-          try { localStorage.setItem(PANEL_WIDTH_KEY, String(panelWidth)); } catch { /* ignore */ }
+          try { localStorage.setItem(PANEL_WIDTH_KEY, String(dragState.current.width)); } catch { /* ignore */ }
         }
         dragState.current = null;
-        window.removeEventListener('mousemove', onMove);
-        window.removeEventListener('mouseup', onUp);
+        divider.removeEventListener('pointermove', onMove);
+        divider.removeEventListener('pointerup', onUp);
+        divider.removeEventListener('pointercancel', onUp);
+        divider.removeEventListener('lostpointercapture', onUp);
       };
-      window.addEventListener('mousemove', onMove);
-      window.addEventListener('mouseup', onUp);
+      divider.addEventListener('pointermove', onMove);
+      divider.addEventListener('pointerup', onUp);
+      divider.addEventListener('pointercancel', onUp);
+      divider.addEventListener('lostpointercapture', onUp);
     },
-    [panelWidth],
+    [panelWidth, showTradingPanel, showAccountPanel],
   );
 
+  const navigate = async (next: typeof page) => {
+    navigationGeneration.current++;
+    setReplayPlaying(false);
+    if (sessionRef.current && next !== 'replay' && !await exitReplay()) return;
+    setPage(next);
+  };
+  const chartVisible = page === 'chart' || (page === 'replay' && replayActive);
+  const sidebarVisible = showTradingPanel || showAccountPanel || replayActive;
+  const searchDragHandle = <button
+    type="button" aria-label="拖动合约搜索栏" title="拖动合约搜索栏；双击恢复默认位置"
+    onPointerDown={symbolSearchDrag.onHandlePointerDown} onDoubleClick={symbolSearchDrag.reset}
+    className="shrink-0 touch-none cursor-grab rounded p-1 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)] active:cursor-grabbing"
+  ><GripVertical className="h-3.5 w-3.5" /></button>;
+
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-[var(--tv-bg)]">
-      {/* 图表区 */}
-      <div className="relative min-w-0 flex-1">
-        {defaultSymbol ? (
-          <TvAdvancedChart
-            key={replayActive ? 'replay' : 'live'}
-            datafeed={datafeed}
-            symbol={defaultSymbol}
-            initialInterval={initialInterval}
-            theme={theme}
-            onWidgetReady={handleWidgetReady}
-          />
-        ) : (
-          <div className="flex h-full items-center justify-center text-sm text-[var(--tv-muted)]">
-            正在初始化数据源…
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-[var(--tv-bg)]">
+      <nav aria-label="主导航" className="flex h-12 shrink-0 items-center gap-1 border-b border-[var(--tv-border)] bg-[var(--tv-panel)] px-3 text-sm text-[var(--tv-text)]">
+        <span className="mr-3 hidden 2xl:inline text-xs font-semibold tracking-widest">NT8 TERMINAL</span>
+        {([{ id: 'chart', label: '交易图表' }, { id: 'overview', label: '账户总览' }, { id: 'records', label: '交易记录' }, { id: 'replay', label: '回放模拟' }] as const).map(item =>
+          <button key={item.id} aria-current={page === item.id ? 'page' : undefined} onClick={() => void navigate(item.id)}
+            className={`whitespace-nowrap rounded-md px-2 py-2 sm:px-4 ${page === item.id ? 'bg-[#2962ff]/15 text-[#5b8cff]' : 'text-[var(--tv-muted)] hover:text-[var(--tv-text)]'}`}>{item.label}</button>)}
+        {replayActive && <span className="ml-2 hidden max-w-40 truncate text-xs text-amber-500 xl:inline">{replayRecordRef.current?.name}</span>}
+        <div role="toolbar" aria-label="页面工具栏" className="ml-auto flex shrink-0 items-center gap-1 border-l border-[var(--tv-border)] pl-3">
+          <div role="group" aria-label="图表布局" className="mr-1 flex items-center rounded border border-[var(--tv-border)]">
+            {([{ count: 1, label: '单图', icon: Square }, { count: 2, label: '双图', icon: Columns2 }, { count: 4, label: '四图', icon: Grid2X2 }] as const).map(item => <button
+              key={item.count} type="button" aria-label={item.label} aria-pressed={(replayActive ? 1 : chartCount) === item.count}
+              title={replayActive ? '回放使用当前会话的单图表' : item.label} disabled={!chartVisible || replayActive}
+              onClick={() => setChartCount(item.count)} className={`rounded p-1.5 disabled:opacity-40 ${(replayActive ? 1 : chartCount) === item.count ? 'bg-[#2962ff]/15 text-[#5b8cff]' : 'text-[var(--tv-muted)] hover:bg-[var(--tv-border)]'}`}>
+              <item.icon className="h-3.5 w-3.5" />
+            </button>)}
           </div>
-        )}
-
-        {/* 常用合约收藏栏(顶部居中) */}
-        <div className="absolute left-1/2 top-2 z-40 -translate-x-1/2">
-          <SymbolFavorites
-            listSymbols={() => datafeed.listSymbols()}
-            current={chartSymbol}
-            onSelect={(s) => {
-              const w = widgetRef.current;
-              if (!w) return;
-              w.onChartReady(() => {
-                try {
-                  w.activeChart().setSymbol(s);
-                } catch {
-                  /* 合约解析失败时图表保持原样 */
-                }
-              });
-            }}
-          />
-        </div>
-
-        {/* NT8 已连接但合约列表为空的提示 */}
-        {symbolsEmpty && status === 'nt8' && (
-          <div className="absolute left-1/2 top-12 z-50 -translate-x-1/2 rounded-md border border-[#f0b90b]/40 bg-[var(--tv-panel)]/95 px-4 py-2 text-xs text-[#f0b90b] shadow-lg">
-            NT8 已连接,但合约库为空:请在 NT8 中确认合约已加载,
-            或直接在图表搜索框输入合约名(如 NQ SEP26)。
-          </div>
-        )}
-
-        {/* 回放控制条(左上浮条;进入后下单走模拟引擎) */}
-        <ReplayBar
-          active={replayActive}
-          cursor={replayCursor}
-          playing={replayPlaying}
-          speed={replaySpeed}
-          stepSec={replayStepSec}
-          onStart={enterReplay}
-          onStep={stepReplay}
-          onTogglePlay={() => setReplayPlaying((v) => !v)}
-          onSpeedChange={setReplaySpeed}
-          onStepSecChange={setReplayStepSec}
-          onExit={exitReplay}
-        />
-
-        {/* 悬浮状态面板(左侧把手可拖动,位置记忆) */}
-        <div
-          data-draggable-panel
-          style={statusDrag.pos ? { left: statusDrag.pos.x, top: statusDrag.pos.y, right: 'auto' } : undefined}
-          className="absolute right-3 top-2 z-50 flex items-center gap-2 rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)]/95 px-2 py-1.5 shadow-lg backdrop-blur"
-        >
-          <span
-            className="cursor-move text-[var(--tv-muted)] hover:text-[var(--tv-text)]"
-            title="按住拖动"
-            onMouseDown={statusDrag.onHandleMouseDown}
-          >
-            <GripVertical className="h-3.5 w-3.5" />
-          </span>
+          <Button variant="ghost" size="sm" disabled={!chartVisible} aria-label="交易面板" aria-pressed={showTradingPanel}
+            onClick={() => setShowTradingPanel(value => !value)}
+            className={`h-7 gap-1 px-2 text-xs ${showTradingPanel ? 'bg-[#2962ff]/15 text-[#5b8cff]' : 'text-[var(--tv-muted)]'}`}>
+            <PanelRight className="h-3.5 w-3.5" /><span>交易面板</span>
+          </Button>
+          <Button variant="ghost" size="sm" disabled={!chartVisible} aria-label="账户信息" aria-pressed={showAccountPanel}
+            onClick={() => setShowAccountPanel(value => !value)}
+            className={`h-7 gap-1 px-2 text-xs ${showAccountPanel ? 'bg-[#2962ff]/15 text-[#5b8cff]' : 'text-[var(--tv-muted)]'}`}>
+            <Wallet className="h-3.5 w-3.5" /><span>账户信息</span>
+          </Button>
           {status === 'connecting' && (
             <Badge variant="outline" className="border-[var(--tv-border)] text-[var(--tv-text)]">
               正在连接数据桥…
             </Badge>
           )}
           {status === 'nt8' && (
-            <Badge className="border-transparent bg-[#26a69a]/15 text-[#26a69a] hover:bg-[#26a69a]/15">
+            <Badge className="max-w-32 truncate border-transparent bg-[#26a69a]/15 text-[#26a69a] hover:bg-[#26a69a]/15">
               NT8 已连接{nt8Info?.connectionName ? ` · ${nt8Info.connectionName}` : ''}
             </Badge>
           )}
@@ -717,6 +876,8 @@ export default function ChartTerminal() {
             className={`h-7 w-7 hover:bg-[var(--tv-border)] ${
               showTradeHistory ? 'text-[#2962ff]' : 'text-[var(--tv-muted)]'
             }`}
+            aria-label={showTradeHistory ? '隐藏交易历史' : '显示交易历史'}
+            aria-pressed={showTradeHistory}
             title={showTradeHistory ? '隐藏交易历史' : '显示交易历史'}
             onClick={toggleTradeHistory}
           >
@@ -727,6 +888,7 @@ export default function ChartTerminal() {
             variant="ghost"
             size="icon"
             className="h-7 w-7 text-[var(--tv-text)] hover:bg-[var(--tv-border)]"
+            aria-label="重新连接数据桥"
             title="重新连接数据桥"
             onClick={() => void connect()}
           >
@@ -737,6 +899,7 @@ export default function ChartTerminal() {
             variant="ghost"
             size="icon"
             className="h-7 w-7 text-[var(--tv-text)] hover:bg-[var(--tv-border)]"
+            aria-label={theme === 'dark' ? '切换为白天模式' : '切换为黑夜模式'}
             title={theme === 'dark' ? '切换为白天模式' : '切换为黑夜模式'}
             onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
           >
@@ -747,6 +910,7 @@ export default function ChartTerminal() {
             variant="ghost"
             size="icon"
             className="h-7 w-7 text-[var(--tv-text)] hover:bg-[var(--tv-border)]"
+            aria-label="数据桥设置"
             title="数据桥设置"
             onClick={() => setSettingsOpen((v) => !v)}
           >
@@ -754,9 +918,15 @@ export default function ChartTerminal() {
           </Button>
         </div>
 
+      </nav>
+      {replayActive && (replayStorageError || replayOperationError) && <div role="alert" className="flex shrink-0 items-center justify-between gap-3 bg-red-500/10 px-4 py-2 text-sm text-red-400">
+        <span>{replayStorageError ? `会话尚未保存：${replayStorageError}` : replayOperationError}</span>
+        {replayStorageError && <button className="shrink-0 underline" onClick={() => saveReplayRef.current()}>重试保存</button>}
+      </div>}
         {/* 数据桥设置浮窗(可拖动:标题栏为手柄,非模态不挡图表) */}
         {settingsOpen && (
           <div
+            ref={settingsDrag.panelRef}
             data-draggable-panel
             className="fixed z-[100] w-80 rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)] text-[var(--tv-text)] shadow-xl"
             style={
@@ -766,13 +936,13 @@ export default function ChartTerminal() {
             }
           >
             <div
-              onMouseDown={settingsDrag.onHandleMouseDown}
-              className="flex cursor-move items-center justify-between border-b border-[var(--tv-border)] px-3 py-2 select-none"
+              onPointerDown={settingsDrag.onHandlePointerDown}
+              className="flex touch-none cursor-move items-center justify-between border-b border-[var(--tv-border)] px-3 py-2 select-none"
               title="按住拖动"
             >
               <span className="text-sm font-semibold">数据桥设置</span>
               <button
-                onMouseDown={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
                 onClick={() => setSettingsOpen(false)}
                 className="rounded p-0.5 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)]"
                 title="关闭"
@@ -782,8 +952,8 @@ export default function ChartTerminal() {
             </div>
             <div className="p-3">
               <p className="mb-2 text-xs text-[var(--tv-muted)]">
-                NinjaTrader 8 数据桥 AddOn 的 HTTP 地址,默认为{' '}
-                {DEFAULT_BRIDGE_URL_DISPLAY}。修改后请点击"保存并重连"。
+                远程访问默认通过当前网站连接 NT8，本机 HTTP 访问默认直连数据桥。
+                留空恢复默认：{DEFAULT_BRIDGE_URL_DISPLAY}。修改后请点击“保存并重连”。
               </p>
               <Input
                 value={bridgeUrlDraft}
@@ -805,22 +975,112 @@ export default function ChartTerminal() {
             </div>
           </div>
         )}
+      <div className="relative min-h-0 flex-1">
+      <div inert={!chartVisible} aria-hidden={!chartVisible} className={`absolute inset-0 flex ${chartVisible ? '' : 'invisible opacity-0 pointer-events-none'}`}>
+      {/* 图表区 */}
+      <div className="relative min-w-0 flex-1">
+        {defaultSymbol && status !== 'connecting' ? (
+          <ChartWorkspace
+            ref={workspaceRef}
+            key={`${replayActive ? replayRecordRef.current?.id : 'live'}-${feedGeneration}`}
+            count={replayActive ? 1 : chartCount}
+            datafeed={datafeed}
+            symbol={defaultSymbol}
+            initialInterval={widgetInterval}
+            symbols={knownSymbols}
+            replay={replayActive}
+            theme={theme}
+            account={account}
+            tradingEnabled={status === 'nt8' || replayActive}
+            orders={orders}
+            positions={positions}
+            brackets={brackets}
+            qty={qty}
+            showTradeHistory={showTradeHistory}
+            tradeSig={tradeSig}
+            onChanged={refreshTrading}
+            onActiveWidget={handleWidgetReady}
+          />
+        ) : (
+          <div className="flex h-full items-center justify-center text-sm text-[var(--tv-muted)]">
+            正在初始化数据源…
+          </div>
+        )}
+
+        {/* 合约栏可拖动；默认居中，双击把手恢复默认位置 */}
+        <div
+          ref={symbolSearchDrag.panelRef}
+          data-draggable-panel
+          data-symbol-search
+          className="absolute z-40 max-w-[calc(100%-16px)]"
+          style={symbolSearchDrag.pos
+            ? { left: symbolSearchDrag.pos.x, top: symbolSearchDrag.pos.y }
+            : { top: !replayActive && chartCount > 1 ? 34 : 8, left: '50%', transform: 'translateX(-50%)' }}
+        >
+          {replayActive ? <div aria-label="回放会话合约" className="flex items-center gap-2 rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)] px-2 py-1 text-xs text-[var(--tv-text)]">
+            {searchDragHandle}<span>{replayRecordRef.current?.symbol}</span><span className="text-amber-500">回放</span>
+          </div> : <SymbolFavorites
+            dragHandle={searchDragHandle}
+            listSymbols={() => datafeed.listSymbols()}
+            current={chartSymbol}
+            onSelect={(s) => {
+              const w = widgetRef.current;
+              if (!w) return;
+              w.onChartReady(() => {
+                try {
+                  w.activeChart().setSymbol(s);
+                } catch {
+                  /* 合约解析失败时图表保持原样 */
+                }
+              });
+            }}
+          />}
+        </div>
+
+        {/* NT8 已连接但合约列表为空的提示 */}
+        {symbolsEmpty && status === 'nt8' && (
+          <div className="absolute left-1/2 top-12 z-50 -translate-x-1/2 rounded-md border border-[#f0b90b]/40 bg-[var(--tv-panel)]/95 px-4 py-2 text-xs text-[#f0b90b] shadow-lg">
+            NT8 已连接,但合约库为空:请在 NT8 中确认合约已加载,
+            或直接在图表搜索框输入合约名(如 NQ SEP26)。
+          </div>
+        )}
+
+
       </div>
 
       {/* 分隔条 */}
-      <div
-        onMouseDown={onDividerDown}
-        className="w-1 shrink-0 cursor-col-resize bg-[var(--tv-border)] transition-colors hover:bg-[#2962ff]"
+      {sidebarVisible && <div
+        onPointerDown={onDividerDown}
+        className="w-1 shrink-0 touch-none cursor-col-resize bg-[var(--tv-border)] transition-colors hover:bg-[#2962ff]"
         title="拖拽调整面板宽度"
-      />
+      />}
 
       {/* 交易面板 */}
       <div
-        style={{ width: panelWidth }}
-        className="shrink-0 border-l border-[var(--tv-border)]"
+        style={{ width: panelWidth * Math.max(1, Number(showTradingPanel) + Number(showAccountPanel)), maxWidth: 'calc(100% - 360px)' }}
+        data-sidebar hidden={!sidebarVisible}
+        className={`${sidebarVisible ? 'flex' : 'hidden'} min-h-0 shrink-0 flex-col overflow-hidden border-l border-[var(--tv-border)] bg-[var(--tv-panel)]`}
       >
-        <TradingPanel
-          enabled={status === 'nt8' || replayActive}
+        {replayActive && <div className="shrink-0 border-b border-[var(--tv-border)]" data-replay-panel><ReplayBar
+            active={replayActive}
+            enabled={status === 'nt8' && !!widget}
+            cursor={replayCursor}
+            playing={replayPlaying}
+            speed={replaySpeed}
+            stepSec={replayStepSec}
+            onStart={start => void enterReplay(start)}
+            onStep={stepReplay}
+            onTogglePlay={() => setReplayPlaying(v => !v)}
+            onSpeedChange={speed => { setReplaySpeed(speed); if (replayRecordRef.current) replayRecordRef.current.speed = speed; if (!stepInFlight.current) saveReplayRef.current(); }}
+            onStepSecChange={step => { setReplayStepSec(step); if (replayRecordRef.current) replayRecordRef.current.stepSec = step; if (!stepInFlight.current) saveReplayRef.current(); }}
+            onExit={() => void exitReplay()}
+          /></div>}
+        <div className="min-h-0 flex-1"><TradingPanel
+          showTradingPanel={showTradingPanel}
+          showAccountPanel={showAccountPanel}
+          onCloseTradingPanel={() => setShowTradingPanel(false)}
+          onCloseAccountPanel={() => setShowAccountPanel(false)}
+          enabled={!!widget && (status === 'nt8' || replayActive)}
           symbol={chartSymbol}
           tickSize={tickSize}
           accounts={accounts}
@@ -850,7 +1110,17 @@ export default function ChartTerminal() {
           refPrice={effectiveRef}
           onRefreshRef={refreshRefPrice}
           getMarketPrice={getMarketPrice}
-        />
+        /></div>
+      </div>
+      </div>
+      {(page === 'overview' || page === 'records') && <div className="absolute inset-0"><AccountPages
+        page={page} accounts={liveAccounts} error={liveAccountsError} enabled={status === 'nt8'} onRefresh={refreshLiveAccounts}
+      /></div>}
+      {page === 'replay' && !replayActive && <div className="absolute inset-0"><ReplayDashboard
+        sessions={replaySessions} onCreate={newReplay} onResume={resumeReplay} onDelete={removeReplay}
+        defaultSymbol={chartSymbol || defaultSymbol} symbols={knownSymbols.map(s => s.symbol)}
+        storageError={replayStorageError || undefined} adapter={status === 'nt8' ? adapterRef.current || undefined : undefined}
+      /></div>}
       </div>
     </div>
   );

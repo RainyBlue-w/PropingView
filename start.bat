@@ -29,8 +29,8 @@ if not exist node_modules (
 
 if /i "%~1"=="prod" goto prod
 
-echo 启动开发服务器: http://127.0.0.1:7100/
-call npm run dev -- --host 127.0.0.1 --port 7100
+echo 启动开发服务器: http://0.0.0.0:7100/
+call npm run dev -- --host 0.0.0.0 --port 7100
 goto end
 
 :prod
@@ -41,8 +41,8 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-echo 启动生产预览: http://127.0.0.1:7100/
-call npm run preview -- --host 127.0.0.1 --port 7100
+echo 启动生产预览: http://0.0.0.0:7100/
+call npm run preview -- --host 0.0.0.0 --port 7100
 
 :end
 endlocal

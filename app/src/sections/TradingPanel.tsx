@@ -8,9 +8,14 @@ import {
   type Nt8Position,
 } from '@/lib/nt8Trading';
 import { trading } from '@/lib/tradingRouter';
+import { getBridgeUrl } from '@/lib/config';
 import { amountToPrice, detectOrderType, type DraftSide } from '@/lib/draftCalc';
 
 interface TradingPanelProps {
+  showTradingPanel?: boolean;
+  showAccountPanel?: boolean;
+  onCloseTradingPanel?: () => void;
+  onCloseAccountPanel?: () => void;
   enabled: boolean;
   symbol: string;
   tickSize: number;
@@ -101,6 +106,10 @@ function groupByConnection(list: Nt8Account[]): AccountGroup[] {
 const COLLAPSED_KEY = 'tv-collapsed-conn-groups';
 
 export default function TradingPanel({
+  showTradingPanel = true,
+  showAccountPanel = true,
+  onCloseTradingPanel,
+  onCloseAccountPanel,
   enabled,
   symbol,
   tickSize,
@@ -135,9 +144,21 @@ export default function TradingPanel({
   const [tpPrice, setTpPrice] = useState('');
   const [slPrice, setSlPrice] = useState('');
   const [busy, setBusy] = useState(false);
+  const [rowActions, setRowActions] = useState<Record<string, { busy: boolean; ok?: boolean; text?: string }>>({});
+  const pendingRowActions = useRef(new Set<string>());
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
-  /** 面板页签:交易 | 账户信息 */
-  const [page, setPage] = useState<'trade' | 'accounts'>('trade');
+  const [ticketSymbol, setTicketSymbol] = useState(symbol);
+  const symbolContext = useRef(0);
+  useEffect(() => {
+    symbolContext.current += 1;
+  }, [symbol]);
+  // 绝对价格仅属于当前合约；切图时同步清空，隐藏面板不影响表单。
+  if (ticketSymbol !== symbol) {
+    setTicketSymbol(symbol);
+    setTpPrice('');
+    setSlPrice('');
+    setMessage(null);
+  }
   /** 账户下拉(自绘,支持 Connection 分组折叠) */
   const [ddOpen, setDdOpen] = useState(false);
   const ddRef = useRef<HTMLDivElement>(null);
@@ -170,10 +191,13 @@ export default function TradingPanel({
     return () => document.removeEventListener('mousedown', onDoc);
   }, [ddOpen]);
 
-  const workingOrders = orders.filter(
-    (o) => WORKING_STATES.has(o.state) && o.instrument === symbol,
-  );
-  const position = positions.find((p) => p.instrument === symbol);
+  // API 已按当前账户查询；此处必须列出该账户所有合约，不随当前图表筛选。
+  const workingOrders = orders.filter((o) => WORKING_STATES.has(o.state));
+  const openPositions = positions.filter((p) => Number.isFinite(p.quantity) && p.quantity !== 0);
+  const rowKey = (kind: 'position' | 'order', id: string) => JSON.stringify([account, kind, id]);
+  // 其他合约可能使用不同 tick；账户列表不能套用当前图表的小数位。
+  const formatRowPrice = (price: number) => Number.isFinite(price)
+    ? price.toLocaleString('en-US', { useGrouping: false, minimumFractionDigits: 2, maximumFractionDigits: 8 }) : '—';
   /** 当前账户的财务信息(净值/已实现/浮盈),随 3 秒轮询刷新 */
   const currentAccount = accounts.find((a) => a.name === account);
   /** 交易下拉框只显可见账户;账户页可见在前、隐藏沉底(保持各自原有顺序) */
@@ -202,6 +226,7 @@ export default function TradingPanel({
       : null;
 
   const submit = async (clicked: DraftSide) => {
+    const submittedContext = symbolContext.current;
     // 草稿模式两段式:点击与当前预览方向不同的按钮 -> 先切方向(虚线镜像),再点才提交
     if (mode === 'draft' && clicked !== side) {
       onSideChange(clicked);
@@ -262,6 +287,10 @@ export default function TradingPanel({
         tpAmount: mode === 'draft' && kind === 'MKT' && tpA > 0 ? tpA : undefined,
         slAmount: mode === 'draft' && kind === 'MKT' && slA > 0 ? slA : undefined,
       });
+      if (submittedContext !== symbolContext.current) {
+        onChanged();
+        return;
+      }
       const mktAmt =
         mode === 'draft' && kind === 'MKT' && (tpA > 0 || slA > 0)
           ? `${tpA > 0 ? ` · 止盈 $${tpA}` : ''}${slA > 0 ? ` · 止损 $${slA}` : ''}(按实际成交价定位)`
@@ -283,34 +312,34 @@ export default function TradingPanel({
       }
       onChanged();
     } catch (err) {
-      setMessage({ ok: false, text: err instanceof Error ? err.message : '下单失败' });
+      if (submittedContext === symbolContext.current) {
+        setMessage({ ok: false, text: err instanceof Error ? err.message : '下单失败' });
+      }
     } finally {
       setBusy(false);
     }
   };
 
-  const cancelOrder = async (orderId: string) => {
+  const runRowAction = async (key: string, action: () => Promise<unknown>, success: string, failure: string) => {
+    if (!enabled || !account || pendingRowActions.current.has(key)) return;
+    pendingRowActions.current.add(key);
+    setRowActions(current => ({ ...current, [key]: { busy: true } }));
     try {
-      await trading.cancelOrder(account, orderId);
+      await action();
+      setRowActions(current => ({ ...current, [key]: { busy: false, ok: true, text: success } }));
       onChanged();
     } catch (err) {
-      setMessage({ ok: false, text: err instanceof Error ? err.message : '撤单失败' });
+      setRowActions(current => ({ ...current, [key]: { busy: false, ok: false, text: err instanceof Error ? err.message : failure } }));
+    } finally {
+      pendingRowActions.current.delete(key);
     }
   };
 
-  const closePosition = async () => {
-    if (!position) return;
-    setBusy(true);
-    try {
-      await trading.closePosition(account, symbol);
-      setMessage({ ok: true, text: '平仓单已提交' });
-      onChanged();
-    } catch (err) {
-      setMessage({ ok: false, text: err instanceof Error ? err.message : '平仓失败' });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const cancelOrder = (orderId: string) => runRowAction(rowKey('order', orderId),
+    () => trading.cancelOrder(account, orderId), '撤单已提交', '撤单失败');
+
+  const closePosition = (instrument: string) => runRowAction(rowKey('position', instrument),
+    () => trading.closePosition(account, instrument), '平仓单已提交', '平仓失败');
 
   const inputCls =
     'h-8 border-[var(--tv-border)] bg-[var(--tv-bg)] text-[var(--tv-text)] text-xs font-mono';
@@ -410,60 +439,37 @@ export default function TradingPanel({
   );
 
   return (
-    <div className="flex h-full flex-col overflow-y-auto bg-[var(--tv-panel)] text-[var(--tv-text)]">
-      {/* 页签:交易 | 账户信息 */}
-      <div className="grid shrink-0 grid-cols-2 gap-1 border-b border-[var(--tv-border)] p-2 text-xs">
-        <button
-          onClick={() => setPage('trade')}
-          className={`rounded py-1 font-semibold transition-colors ${
-            page === 'trade' ? 'bg-[#2962ff] text-white' : 'text-[var(--tv-muted)] hover:text-[var(--tv-text)]'
-          }`}
-        >
-          交易
-        </button>
-        <button
-          onClick={() => setPage('accounts')}
-          className={`rounded py-1 font-semibold transition-colors ${
-            page === 'accounts' ? 'bg-[#2962ff] text-white' : 'text-[var(--tv-muted)] hover:text-[var(--tv-text)]'
-          }`}
-        >
-          账户
-        </button>
-      </div>
-
-      {/* 持仓/订单轮询失败提示(两个页签都可见) */}
-      {pollError && (
+    <div className="flex h-full min-h-0 flex-col gap-px overflow-hidden bg-[var(--tv-border)] text-[var(--tv-text)]">
+      {/* 持仓/订单轮询失败提示由两个面板共用。 */}
+      {pollError && (showTradingPanel || showAccountPanel) && (
         <div className="mx-2 mt-2 shrink-0 rounded border border-[#ef5350]/40 bg-[#ef5350]/10 px-2 py-1.5 text-[11px] leading-4 text-[#ef5350]">
           持仓/订单读取失败:{pollError}
           <br />
-          可在浏览器打开 http://127.0.0.1:8090/api/debug 自查桥端状态
+          可打开 <a className="underline" href={`${getBridgeUrl()}/api/debug`} target="_blank" rel="noreferrer">数据桥诊断</a> 自查桥端状态
         </div>
       )}
 
-      {page === 'accounts' ? (
-        /* ---- 账户信息页:各账户余额与盈亏 ---- */
-        <div className="flex-1 p-3">
-          {accounts.length === 0 && (
-            <div className="text-[11px] text-[var(--tv-muted)]">
-              无账户数据(需连接 NT8 数据桥)
-            </div>
+      <div className="flex min-h-0 min-w-0 flex-1 gap-px overflow-hidden">
+      <section
+        id="trading-page-trade"
+        aria-labelledby="trading-panel-heading"
+        className={`${showTradingPanel ? 'flex' : 'hidden'} min-h-0 min-w-0 flex-1 flex-col bg-[var(--tv-panel)]`}
+      >
+        <div className="flex h-9 shrink-0 items-center justify-between border-b border-[var(--tv-border)] px-3">
+          <h2 id="trading-panel-heading" className="text-xs font-semibold">交易面板</h2>
+          {onCloseTradingPanel && (
+            <button
+              type="button"
+              onClick={onCloseTradingPanel}
+              aria-label="关闭交易面板"
+              title="关闭交易面板"
+              className="rounded p-1 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)]"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
           )}
-          <div className="space-y-2">
-            {groupByConnection(sortedAccounts).map((g) => (
-              <div key={g.connection}>
-                {renderGroupHeader(g)}
-                {!collapsed.includes(g.connection) && (
-                  <div className="space-y-2">{g.items.map(renderAccountCard)}</div>
-                )}
-              </div>
-            ))}
-          </div>
-          <div className="mt-3 text-[11px] leading-4 text-[var(--tv-muted)]">
-            数据每 3 秒随交易轮询刷新;点击卡片可切换当前交易账户;眼睛图标隐藏/恢复账户(隐藏的沉底且不可选)。
-          </div>
         </div>
-      ) : (
-      <>
+      <div className="min-h-0 flex-1 overflow-y-auto">
       {/* 账户 */}
       <div className="border-b border-[var(--tv-border)] p-3">
         <div className={labelCls}>账户</div>
@@ -768,32 +774,40 @@ export default function TradingPanel({
 
       {/* 持仓 */}
       <div className="border-b border-[var(--tv-border)] p-3">
-        <div className="mb-1.5 text-xs font-semibold">当前合约持仓</div>
-        {position ? (
-          <div className="flex items-center justify-between rounded bg-[var(--tv-bg)] px-2 py-1.5 text-xs">
-            <span className={position.quantity > 0 ? 'text-[#26a69a]' : 'text-[#ef5350]'}>
-              {position.quantity > 0 ? '多' : '空'} {Math.abs(position.quantity)} 手
-            </span>
-            <span className="font-mono text-[var(--tv-text)]">均价 {position.averagePrice.toFixed(decimals)}</span>
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={busy}
-              onClick={() => void closePosition()}
-              className="h-6 px-2 text-[11px] text-[#f0b90b] hover:bg-[var(--tv-border)]"
-            >
-              市价平仓
-            </Button>
-          </div>
-        ) : (
+        <div className="mb-1.5 text-xs font-semibold">所有持仓</div>
+        {openPositions.length === 0 ? (
           <div className="text-[11px] text-[var(--tv-muted)]">无持仓</div>
-        )}
+        ) : <div className="space-y-1">
+          {openPositions.map(position => {
+            const action = rowActions[rowKey('position', position.instrument)];
+            return <div key={position.instrument} data-position-instrument={position.instrument}
+              className="rounded bg-[var(--tv-bg)] px-2 py-1.5 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="min-w-0 truncate font-mono font-semibold" title={position.instrument}>{position.instrument}</span>
+                <Button size="sm" variant="ghost" disabled={!enabled || !account || action?.busy}
+                  aria-label={`市价平仓 ${position.instrument}`}
+                  onClick={() => void closePosition(position.instrument)}
+                  className="h-6 shrink-0 px-2 text-[11px] text-[#f0b90b] hover:bg-[var(--tv-border)]">
+                  {action?.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : '市价平仓'}
+                </Button>
+              </div>
+              <div className="mt-1 flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+                <span className={position.quantity > 0 ? 'text-[#26a69a]' : 'text-[#ef5350]'}>
+                  {position.quantity > 0 ? '多' : '空'} {Math.abs(position.quantity)} 手
+                </span>
+                <span className="font-mono text-[var(--tv-text)]">均价 {formatRowPrice(position.averagePrice)}</span>
+              </div>
+              {action?.text && <div role={action.ok ? 'status' : 'alert'}
+                className={`mt-1 text-[11px] ${action.ok ? 'text-[#26a69a]' : 'text-[#ef5350]'}`}>{action.text}</div>}
+            </div>;
+          })}
+        </div>}
       </div>
 
       {/* 工作中订单 */}
       <div className="flex-1 p-3">
         <div className="mb-1.5 text-xs font-semibold">
-          工作中订单({workingOrders.length})
+          所有工作中订单<span className="ml-1 font-normal text-[var(--tv-muted)]">({workingOrders.length})</span>
         </div>
         <div className="space-y-1">
           {workingOrders.length === 0 && (
@@ -804,24 +818,33 @@ export default function TradingPanel({
             const isTp = o.name.includes('TP');
             const isSl = o.name.includes('SL');
             const price = o.limitPrice || o.stopPrice;
+            const action = rowActions[rowKey('order', o.orderId)];
             return (
               <div
                 key={o.orderId}
-                className="flex items-center justify-between rounded bg-[var(--tv-bg)] px-2 py-1.5 text-xs"
+                data-order-id={o.orderId}
+                className="rounded bg-[var(--tv-bg)] px-2 py-1.5 text-xs"
               >
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <span className="min-w-0 truncate font-mono font-semibold" title={o.instrument}>{o.instrument}</span>
+                  <button
+                    onClick={() => void cancelOrder(o.orderId)} disabled={!enabled || !account || action?.busy}
+                    aria-label={`撤销 ${o.instrument} 订单 ${o.orderId}`}
+                    className="shrink-0 rounded p-0.5 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[#ef5350] disabled:opacity-40"
+                    title="撤单">
+                    {action?.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <X className="h-3.5 w-3.5" />}
+                  </button>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
                 <span className={isBuy ? 'text-[#26a69a]' : 'text-[#ef5350]'}>
                   {isBuy ? '买' : '卖'} {o.quantity - o.filled} 手
                   {isTp && <span className="ml-1 text-[#26a69a]">·止盈</span>}
                   {isSl && <span className="ml-1 text-[#ef5350]">·止损</span>}
                 </span>
-                <span className="font-mono">@ {price.toFixed(decimals)}</span>
-                <button
-                  onClick={() => void cancelOrder(o.orderId)}
-                  className="rounded p-0.5 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[#ef5350]"
-                  title="撤单"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
+                <span className="font-mono">{price > 0 ? `@ ${formatRowPrice(price)}` : '市价'}</span>
+                </div>
+                {action?.text && <div role={action.ok ? 'status' : 'alert'}
+                  className={`mt-1 text-[11px] ${action.ok ? 'text-[#26a69a]' : 'text-[#ef5350]'}`}>{action.text}</div>}
               </div>
             );
           })}
@@ -831,8 +854,50 @@ export default function TradingPanel({
           键或右键删除即可撤单。
         </div>
       </div>
-      </>
-      )}
+      </div>
+      </section>
+
+      <section
+        id="trading-page-accounts"
+        aria-labelledby="account-panel-heading"
+        className={`${showAccountPanel ? 'flex' : 'hidden'} min-h-0 min-w-0 flex-1 flex-col bg-[var(--tv-panel)]`}
+      >
+        <div className="flex h-9 shrink-0 items-center justify-between border-b border-[var(--tv-border)] px-3">
+          <h2 id="account-panel-heading" className="text-xs font-semibold">账户信息</h2>
+          {onCloseAccountPanel && (
+            <button
+              type="button"
+              onClick={onCloseAccountPanel}
+              aria-label="关闭账户信息"
+              title="关闭账户信息"
+              className="rounded p-1 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)]"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+          {accounts.length === 0 && (
+            <div className="text-[11px] text-[var(--tv-muted)]">
+              无账户数据(需连接 NT8 数据桥)
+            </div>
+          )}
+          <div className="space-y-2">
+            {groupByConnection(sortedAccounts).map((g) => (
+              <div key={g.connection}>
+                {renderGroupHeader(g)}
+                {!collapsed.includes(g.connection) && (
+                  <div className="space-y-2">{g.items.map(renderAccountCard)}</div>
+                )}
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 text-[11px] leading-4 text-[var(--tv-muted)]">
+            数据每 3 秒随交易轮询刷新;点击卡片可切换当前交易账户;眼睛图标隐藏/恢复账户(隐藏的沉底且不可选)。
+          </div>
+        </div>
+      </section>
+      </div>
     </div>
   );
 }

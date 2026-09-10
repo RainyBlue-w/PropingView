@@ -1,5 +1,5 @@
 import { nt8Trading } from './nt8Trading';
-import type { SimTrading } from './simTrading';
+import { SIM_ACCOUNT, type SimTrading } from './simTrading';
 
 /**
  * 交易后端路由:默认直连 NT8 数据桥;回放模拟期间(setTradingBackend)
@@ -14,14 +14,21 @@ export function setTradingBackend(sim: SimTrading | null): void {
   backend = sim ?? nt8Trading;
 }
 
+function assertTradingAccount(account: string): void {
+  if ((backend === nt8Trading) === (account === SIM_ACCOUNT)) {
+    throw new Error('交易账户与当前会话不一致，请等待页面刷新后重试。');
+  }
+}
+
 export const trading: typeof nt8Trading = {
   getAccounts: () => backend.getAccounts(),
   getPositions: (account) => backend.getPositions(account),
   getOrders: (account) => backend.getOrders(account),
   getBrackets: (account) => backend.getBrackets(account),
   getExecutions: (account, symbol, from, to) => backend.getExecutions(account, symbol, from, to),
-  placeOrder: (payload) => backend.placeOrder(payload),
-  cancelOrder: (account, orderId) => backend.cancelOrder(account, orderId),
-  changeOrder: (account, orderId, price) => backend.changeOrder(account, orderId, price),
-  closePosition: (account, symbol) => backend.closePosition(account, symbol),
+  getExecutionPage: (account, symbol, from, to, offset, limit) => backend.getExecutionPage(account, symbol, from, to, offset, limit),
+  placeOrder: async (payload) => { assertTradingAccount(payload.account); return backend.placeOrder(payload); },
+  cancelOrder: async (account, orderId) => { assertTradingAccount(account); return backend.cancelOrder(account, orderId); },
+  changeOrder: async (account, orderId, price) => { assertTradingAccount(account); return backend.changeOrder(account, orderId, price); },
+  closePosition: async (account, symbol) => { assertTradingAccount(account); return backend.closePosition(account, symbol); },
 };

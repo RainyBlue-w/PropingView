@@ -2,6 +2,12 @@
 @tailwind components;
 @tailwind utilities;
 
+.account-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.account-table th { color: var(--tv-muted); font-weight: 500; text-align: left; background: var(--tv-bg); }
+.account-table th, .account-table td { padding: 14px 20px; white-space: nowrap; }
+.account-table tbody tr + tr { border-top: 1px solid var(--tv-border); }
+.account-table tbody tr:hover { background: color-mix(in srgb, var(--tv-text) 4%, transparent); }
+
 /* 应用主题变量:默认黑夜;.theme-light 挂在 <html> 上切换为白天 */
 @layer base {
   :root {

@@ -1,4 +1,5 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { onBeforeLayoutLoad } from '@/lib/tvLayoutEvents';
 import {
   amountToPrice,
   priceToAmount,
@@ -104,6 +105,9 @@ export function useDraftLines({
 }: UseDraftLinesParams) {
   const linesRef = useRef(new Map<DraftWhich, DraftEntry>());
   const creatingRef = useRef(new Set<DraftWhich>());
+  const loadingLayoutRef = useRef(false);
+  const drawingGenerationRef = useRef(0);
+  const [layoutRevision, setLayoutRevision] = useState(0);
   /** 我们自己主动 removeEntity 的 id,避免 remove 事件误清空面板 */
   const intentionalRemoveRef = useRef(new Set<string>());
   /** 程序化 setPoints 的价格指纹(entityId -> price) */
@@ -132,9 +136,63 @@ export function useDraftLines({
   /** 上次同步时的周期纪元,用于周期切换时整体重建草稿线 */
   const prevEpochRef = useRef(epoch);
 
+  // 布局替换产生的删除/移动属于图表维护，保留面板中的草稿输入。
+  useEffect(() => {
+    if (!widget) return;
+    loadingLayoutRef.current = false;
+    const discardLines = () => {
+      drawingGenerationRef.current += 1;
+      creatingRef.current = new Set();
+      for (const pending of pendingMoveRef.current.values()) clearTimeout(pending.timer);
+      pendingMoveRef.current.clear();
+      settleRef.current.clear();
+      pendingRemoveRef.current.clear();
+      progWriteRef.current.clear();
+      const entries = Array.from(linesRef.current.values());
+      linesRef.current.clear();
+      let chart: any = null;
+      try { chart = widget.activeChart(); } catch { /* 图表已销毁 */ }
+      for (const entry of entries) {
+        intentionalRemoveRef.current.add(String(entry.id));
+        try { chart?.removeEntity(entry.id); } catch { /* 旧布局已经移除绘图 */ }
+      }
+    };
+    const onLoadRequested = () => {
+      loadingLayoutRef.current = true;
+      discardLines();
+    };
+    const onLoaded = () => {
+      loadingLayoutRef.current = true;
+      discardLines();
+      const generation = drawingGenerationRef.current;
+      let resumed = false;
+      const resume = () => {
+        if (resumed || generation !== drawingGenerationRef.current || widgetRef.current !== widget) return;
+        resumed = true;
+        loadingLayoutRef.current = false;
+        // 草稿输入可能完全不变，必须主动触发同步才能恢复预览线。
+        setLayoutRevision((revision) => revision + 1);
+      };
+      try {
+        if (widget.activeChart().dataReady(resume)) resume();
+      } catch { /* 图表已销毁，下次布局加载重新恢复 */ }
+    };
+    const unsubscribeBeforeLoad = onBeforeLayoutLoad(widget, onLoadRequested);
+    widget.subscribe?.('chart_load_requested', onLoadRequested);
+    widget.subscribe?.('chart_loaded', onLoaded);
+    return () => {
+      loadingLayoutRef.current = true;
+      discardLines();
+      unsubscribeBeforeLoad();
+      try { widget.unsubscribe?.('chart_load_requested', onLoadRequested); } catch { /* ignore */ }
+      try { widget.unsubscribe?.('chart_loaded', onLoaded); } catch { /* ignore */ }
+    };
+  }, [widget]);
+
   // ---- drawing_event 订阅:拖拽回填 + 删线清空 ----
   useEffect(() => {
     if (!widget) return;
+    const pendingMoves = pendingMoveRef.current;
 
     const findByEntityId = (entityId: string): [DraftWhich, DraftEntry] | null => {
       for (const kv of Array.from(linesRef.current.entries())) {
@@ -156,6 +214,7 @@ export function useDraftLines({
 
     /** 拖拽结束:补偿位移 -> 吸附 tick -> 回填面板 */
     const flushMove = (which: DraftWhich) => {
+      if (loadingLayoutRef.current) return;
       const pend = pendingMoveRef.current.get(which);
       if (!pend) return;
       pendingMoveRef.current.delete(which);
@@ -193,6 +252,10 @@ export function useDraftLines({
 
     const handler = (id: any, type: string) => {
       const entityId = String(id);
+      if (loadingLayoutRef.current) {
+        if (type === 'remove') intentionalRemoveRef.current.delete(entityId);
+        return;
+      }
 
       if (type === 'remove') {
         if (intentionalRemoveRef.current.delete(entityId)) return; // 我们自己删的
@@ -290,15 +353,14 @@ export function useDraftLines({
     return () => {
       try { (widget as any).unsubscribe('drawing_event', handler); } catch { /* ignore */ }
       window.removeEventListener('mouseup', onMouseUp, true);
-      for (const pend of Array.from(pendingMoveRef.current.values())) clearTimeout(pend.timer);
-      pendingMoveRef.current.clear();
+      for (const pend of pendingMoves.values()) clearTimeout(pend.timer);
+      pendingMoves.clear();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [widget]);
 
   // ---- 面板输入 -> 虚线位置 同步 ----
   useEffect(() => {
-    if (!widget || !symbol) return;
+    if (!widget || !symbol || loadingLayoutRef.current) return;
     let chart: any = null;
     try { chart = (widget as any).activeChart(); } catch { chart = null; }
     if (!chart) return;
@@ -330,6 +392,8 @@ export function useDraftLines({
     // 导致旧线滞留、新线又建一条的重复),统一清掉重建,并丢弃进行中的拖拽/结算状态
     if (prevEpochRef.current !== epoch) {
       prevEpochRef.current = epoch;
+      drawingGenerationRef.current += 1;
+      creatingRef.current = new Set();
       for (const pend of Array.from(pendingMoveRef.current.values())) clearTimeout(pend.timer);
       pendingMoveRef.current.clear();
       settleRef.current.clear();
@@ -345,6 +409,9 @@ export function useDraftLines({
       removeLine('entry');
       return;
     }
+
+    const creating = creatingRef.current;
+    const generation = drawingGenerationRef.current;
 
     // 主题感知的虚线文字色
     const textColor = theme === 'light' ? '#131722' : '#d1d4dc';
@@ -406,8 +473,8 @@ export function useDraftLines({
         }
         return;
       }
-      if (creatingRef.current.has(which)) return;
-      creatingRef.current.add(which);
+      if (creating.has(which)) return;
+      creating.add(which);
       void (async () => {
         try {
           const id = await chart.createMultipointShape([{ time: nowSec, price: target }], {
@@ -427,11 +494,16 @@ export function useDraftLines({
               horzLabelsAlign: 'right',
             },
           });
-          lines.set(which, { id, price: target, time: nowSec, lastText: label, theme });
+          if (generation !== drawingGenerationRef.current || widgetRef.current !== widget || loadingLayoutRef.current) {
+            intentionalRemoveRef.current.add(String(id));
+            try { chart.removeEntity(id); } catch { /* 旧布局已经移除绘图 */ }
+          } else {
+            lines.set(which, { id, price: target, time: nowSec, lastText: label, theme });
+          }
         } catch {
           /* 图表未就绪,下次状态变化重试 */
         } finally {
-          creatingRef.current.delete(which);
+          creating.delete(which);
         }
       })();
     };
@@ -460,22 +532,5 @@ export function useDraftLines({
       }
       upsert(spec.which, target, `草稿${spec.isTp ? '止盈' : '止损'} $${amount} · ${qty}手`, spec.color);
     }
-  }, [widget, symbol, active, side, refPrice, showEntry, entryPrice, qty, tickSize, pointValue, tpAmount, slAmount, theme, epoch]);
-
-  // 组件卸载时清理
-  useEffect(() => {
-    const lines = linesRef.current;
-    const intentional = intentionalRemoveRef.current;
-    return () => {
-      const w = widgetRef.current as any;
-      let chart: any = null;
-      try { chart = w && w.activeChart(); } catch { chart = null; }
-      if (!chart) return;
-      for (const entry of lines.values()) {
-        intentional.add(String(entry.id));
-        try { chart.removeEntity(entry.id); } catch { /* ignore */ }
-      }
-      lines.clear();
-    };
-  }, []);
+  }, [widget, symbol, active, side, refPrice, showEntry, entryPrice, qty, tickSize, pointValue, tpAmount, slAmount, theme, epoch, layoutRevision]);
 }

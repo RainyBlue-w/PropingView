@@ -2,7 +2,8 @@ import { useEffect, useRef } from 'react';
 import { type Nt8Execution } from '@/lib/nt8Trading';
 import { trading } from '@/lib/tradingRouter';
 import { pairRoundTrips } from '@/lib/executionPairs';
-import { ensureExecutionToolPatched } from '@/lib/tvExecutionTool';
+import { compareExecutions, executionTime } from '@/lib/tradeAnalytics';
+import { alignExecutionArrowTip } from '@/lib/tvExecutionArrow';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -11,57 +12,25 @@ interface UseExecutionTradesParams {
   symbol: string;
   /** 空串 = 未选账户/非 NT8,不画 */
   account: string;
-  /** 每 1.00 点美元价值(连线盈亏金额用) */
+  /** 每 1.00 点美元价值(连线盈亏颜色用) */
   pointValue: number;
   /** 成交签名:变化时重新拉取(新成交即时上图) */
   refreshKey: string;
-  /** false = 宿主已切到自绘覆盖层,本 hook 不动作(linetool 回退方案) */
+  /** 图表交易历史开关；关闭时清理全部成交标记及连线 */
   enabled: boolean;
+  /** 周期变化后丢弃旧周期吸附过的绘图，使用原始成交时间重建。 */
+  epoch: number;
 }
 
 /** 拉取的成交历史回溯窗口 */
 const LOOKBACK_SEC = 7 * 86400;
 
 /**
- * 私有路径:创建 LineToolExecution 成交小三角并配置属性。
- * 返回值是图表实体 id(与公开 createMultipointShape 同域,removeEntity 可删)。
- * 任何一步失败抛异常,由调用方回退到公开箭头。
- */
-function createExecTriangle(chart: any, e: Nt8Execution, isBuy: boolean): any {
-  const cw = chart._chartWidget;
-  const model = cw?._model ?? cw?.model?.();
-  if (!model) throw new Error('no chart model');
-  const pane = model.paneForSource(model.mainSeries());
-  const pts = chart._convertUserPointsToDataSource([{ time: e.time, price: e.price }]);
-  const point = pts?.[0];
-  if (!pane || !point) throw new Error('point convert failed');
-  const src = model.createLineTool({ pane, point, linetool: 'LineToolExecution' });
-  if (!src) throw new Error('createLineTool returned null');
-  const color = isBuy ? '#26a69a' : '#ef5350';
-  const p = typeof src.properties === 'function' ? src.properties() : null;
-  if (p) {
-    p.direction?.setValue?.(isBuy ? 'buy' : 'sell');
-    p.text?.setValue?.(`${isBuy ? 'BUY' : 'SELL'} ${e.qty} @${e.price}`);
-    p.tooltip?.setValue?.(
-      `${isBuy ? 'Buy' : 'Sell'} ${e.qty} @ ${e.price}\n${new Date(e.time * 1000).toLocaleString()}\norderId: ${e.orderId}`,
-    );
-    p.arrowBuyColor?.setValue?.('#26a69a');
-    p.arrowSellColor?.setValue?.('#ef5350');
-    p.textColor?.setValue?.(color);
-    p.frozen?.setValue?.(true); // 锁定,防误拖
-  }
-  src.setSavingInChartEnabled?.(false); // 与公开路径 disableSave 对齐:不参与布局保存
-  return src.id();
-}
-
-/**
  * 图表交易历史(交易平台风格):
- * - 成交点:优先用 LineToolExecution 小三角(官网同款,y 经补丁精确锚定成交价,
- *   附带文字与 tooltip;引导见 lib/tvExecutionTool.ts),私有 API 不可用时回退
- *   arrow_up/down 公开箭头(买绿卖红,尖端同样精确对准成交时间/价);
- * - FIFO 配对进出场,画虚线连线并标注盈亏金额(盈绿亏红);
+ * - 成交点:约 12px 的小箭头,买绿卖红,尖端对准成交时间/价,不显示文字;
+ * - FIFO 配对进出场,只画虚线连线(盈绿亏红),不显示盈亏金额或统计标签;
  * - 所有图形 zOrder 顶层、锁定不可拖、不参与保存。
- * 数据来自 /api/executions(NT8 本地库,默认永久保存)。
+ * 数据来自 /api/executions(NT8 本机成交归档,或回放模拟后端)。
  */
 export function useExecutionTrades({
   widget,
@@ -70,10 +39,10 @@ export function useExecutionTrades({
   pointValue,
   refreshKey,
   enabled,
+  epoch,
 }: UseExecutionTradesParams) {
   /** execKey/tripKey -> 图表绘图实体 id */
   const shapesRef = useRef(new Map<string, any>());
-  const creatingRef = useRef(new Set<string>());
 
   useEffect(() => {
     if (!enabled || !widget || !symbol || !account) return;
@@ -85,6 +54,9 @@ export function useExecutionTrades({
     }
     if (!chart) return;
     let cancelled = false;
+    const shapes = shapesRef.current;
+    // 每轮独立，快速关闭再打开时不被上一轮尚未完成的创建任务挡住。
+    const creating = new Set<string>();
 
     const removeShape = (id: any) => {
       try {
@@ -96,17 +68,17 @@ export function useExecutionTrades({
 
     /** 已存在/创建中则跳过,否则创建并把 id 登记进 shapesRef */
     const addShape = (key: string, create: () => Promise<any>) => {
-      if (shapesRef.current.has(key) || creatingRef.current.has(key)) return;
-      creatingRef.current.add(key);
+      if (shapes.has(key) || creating.has(key)) return;
+      creating.add(key);
       void (async () => {
         try {
           const id = await create();
-          if (!cancelled) shapesRef.current.set(key, id);
+          if (!cancelled) shapes.set(key, id);
           else removeShape(id);
         } catch {
           /* 图表未就绪,下次重试 */
         } finally {
-          creatingRef.current.delete(key);
+          creating.delete(key);
         }
       })();
     };
@@ -117,38 +89,62 @@ export function useExecutionTrades({
         const to = Math.floor(Date.now() / 1000);
         ({ executions } = await trading.getExecutions(account, symbol, to - LOOKBACK_SEC, to));
       } catch {
-        return;   // 拉取失败保留已有图形,下次签名变化重试
+        return;   // 拉取失败,下次签名或周期变化重试
       }
       if (cancelled) return;
+      // 原订单和方向信息均不可用时，归档保留记录，但不伪造买卖箭头或参与配对。
+      executions = executions.filter(e => e.side === 'Buy' || e.side === 'Sell');
 
       const seen = new Set<string>();
 
-      // ---- 成交点标记 ----
-      // 首选(私有 API):LineToolExecution 小三角,精确价格锚定 + 文字/tooltip;
-      // 回退(公开 API):arrow_up/down 粗箭头,尖端精确但尺寸固定约 20px
-      // (库未暴露尺寸覆写;颜色键是 arrowColor,color 控制的是附带文本)
-      const execToolReady = await ensureExecutionToolPatched(widget);
+      // 绘图会把 time 固定吸附到创建时的 K 线；必须等新周期数据就绪再创建。
+      // 不读取旧图形的 getPoints()，它已经丢失原成交时间的精度。
+      try {
+        await new Promise<void>(resolve => {
+          if (chart.dataReady(resolve)) resolve();
+        });
+      } catch {
+        return; // widget 已销毁时，等待数据可能抛错。
+      }
       if (cancelled) return;
+      executions = executions.map(e => ({ ...e, time: executionTime(e) })).sort(compareExecutions);
+
+      // ---- 成交点标记 ----
+      // arrow_up/down 的约 20×22px 大小固定；公开 icon 支持 size 缩放。
+      // SVG 外框 14px，箭头实际约 12px；渲染时把尖端对准原始成交点。
       for (const e of executions) {
-        const key = `exec-${e.orderId}-${e.time}-${e.side}-${e.qty}`;
+        const key = e.executionId
+          ? `exec-id-${e.executionId}`
+          : `exec-${e.orderId}-${e.time}-${e.side}-${e.qty}-${e.price}`;
         seen.add(key);
         const isBuy = e.side === 'Buy';
         addShape(key, async () => {
-          if (execToolReady) {
-            try {
-              return createExecTriangle(chart, e, isBuy);
-            } catch {
-              /* 私有路径失败,落公开箭头 */
-            }
-          }
-          return chart.createMultipointShape([{ time: e.time, price: e.price }], {
-            shape: isBuy ? 'arrow_up' : 'arrow_down',
+          const id = await chart.createMultipointShape([{ time: e.time, price: e.price }], {
+            shape: 'icon',
+            icon: isBuy ? 0xf062 : 0xf063,
+            text: '',
             lock: true,
             disableSelection: true,
             disableSave: true,
+            disableUndo: true,
+            showInObjectsTree: false,
             zOrder: 'top',
-            overrides: { arrowColor: isBuy ? '#26a69a' : '#ef5350' },
+            overrides: {
+              size: 14,
+              color: isBuy ? '#26a69a' : '#ef5350',
+              angle: Math.PI / 2,
+              text: '',
+              showLabel: false,
+            },
           });
+          if (id != null && !cancelled) {
+            try {
+              alignExecutionArrowTip(chart.getShapeById(id), isBuy);
+            } catch {
+              // 库接口变化时保留原生图标，仍返回 id 纳入关闭/切周期的清理。
+            }
+          }
+          return id;
         });
       }
 
@@ -160,7 +156,6 @@ export function useExecutionTrades({
         const pnl = Math.round((t.exitPrice - t.entryPrice) * dir * t.qty * pointValue * 100) / 100;
         const win = pnl >= 0;
         const color = win ? '#26a69a' : '#ef5350';
-        const text = `${win ? '+' : ''}${pnl}$`;
         addShape(key, () =>
           chart.createMultipointShape(
             [
@@ -169,18 +164,27 @@ export function useExecutionTrades({
             ],
             {
               shape: 'trend_line',
+              text: '',
               lock: true,
               disableSelection: true,
               disableSave: true,
+              disableUndo: true,
               zOrder: 'top',
               overrides: {
                 linecolor: color,
                 linestyle: 2,
                 linewidth: 1,
-                text,
-                showLabel: true,
-                textcolor: color,
-                fontsize: 11,
+                text: '',
+                showLabel: false,
+                alwaysShowStats: false,
+                showPriceLabels: false,
+                showPriceRange: false,
+                showPercentPriceRange: false,
+                showPipsPriceRange: false,
+                showBarsRange: false,
+                showDateTimeRange: false,
+                showDistance: false,
+                showAngle: false,
               },
             },
           ),
@@ -188,9 +192,9 @@ export function useExecutionTrades({
       }
 
       // 防御性清理:不在最新列表里的图形移除(正常不会发生)
-      for (const [key, id] of Array.from(shapesRef.current)) {
+      for (const [key, id] of Array.from(shapes)) {
         if (!seen.has(key)) {
-          shapesRef.current.delete(key);
+          shapes.delete(key);
           removeShape(id);
         }
       }
@@ -198,9 +202,8 @@ export function useExecutionTrades({
 
     return () => {
       cancelled = true;
-      for (const id of shapesRef.current.values()) removeShape(id);
-      shapesRef.current.clear();
+      for (const id of shapes.values()) removeShape(id);
+      shapes.clear();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [widget, symbol, account, pointValue, refreshKey, enabled]);
+  }, [widget, symbol, account, pointValue, refreshKey, enabled, epoch]);
 }

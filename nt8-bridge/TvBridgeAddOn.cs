@@ -29,6 +29,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -57,10 +58,18 @@ namespace NinjaTrader.NinjaScript.AddOns
             public string Instrument;
             public double Tp;
             public double Sl;
+            public double TpAmount;
+            public double SlAmount;
+            public Order Entry;
+            public bool Activated;
+            public bool PositionObserved;
         }
         private readonly object bracketLock = new object();
-        private readonly Dictionary<string, PendingBracket> pendingBrackets =
-            new Dictionary<string, PendingBracket>();
+        private readonly Dictionary<Order, PendingBracket> pendingBrackets =
+            new Dictionary<Order, PendingBracket>();
+        private readonly HashSet<Account> protectionWorkers = new HashSet<Account>();
+        private readonly Dictionary<Account, long> protectionRevisions = new Dictionary<Account, long>();
+        private readonly ConcurrentDictionary<string, string> protectionErrors = new ConcurrentDictionary<string, string>();
 
         // 每个 合约|周期 /api/history 已返回的最新 bar 时间(unix 秒):
         // 实时流不得发出比这更早的帧(库会报 "time order violation" 并丢弃)。
@@ -79,8 +88,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         // 为每个账户挂四个更新事件的常驻 handler 即迫使 NT8 开始跟踪该账户;
         // 同时用 PositionUpdate 事件维护持仓缓存,作为 Positions 集合仍为空时的兜底。
         private readonly object subscribeLock = new object();
-        private readonly HashSet<string> subscribedAccounts =
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<Account> subscribedAccounts = new HashSet<Account>();
 
         private class CachedPosition
         {
@@ -97,20 +105,24 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (acc == null) return;
             lock (subscribeLock)
             {
-                if (subscribedAccounts.Contains(acc.Name)) return;
-                subscribedAccounts.Add(acc.Name);
-            }
-            try
-            {
-                acc.PositionUpdate += OnAccountPositionUpdate;
-                acc.OrderUpdate += OnAccountOrderNoop;
-                acc.ExecutionUpdate += OnAccountExecutionNoop;
-                acc.AccountItemUpdate += OnAccountItemNoop;
-                NinjaTrader.Code.Output.Process("TvBridgeAddOn 已订阅账户数据: " + acc.Name, PrintTo.OutputTab1);
-            }
-            catch (Exception ex)
-            {
-                NinjaTrader.Code.Output.Process("TvBridgeAddOn 订阅账户失败(" + acc.Name + "): " + ex.Message, PrintTo.OutputTab1);
+                if (subscribedAccounts.Contains(acc)) return;
+                try
+                {
+                    acc.PositionUpdate += OnAccountPositionUpdate;
+                    acc.OrderUpdate += OnAccountOrderNoop;
+                    acc.ExecutionUpdate += OnAccountExecutionNoop;
+                    acc.AccountItemUpdate += OnAccountItemNoop;
+                    subscribedAccounts.Add(acc);
+                    NinjaTrader.Code.Output.Process("TvBridgeAddOn 已订阅账户数据: " + acc.Name, PrintTo.OutputTab1);
+                }
+                catch (Exception ex)
+                {
+                    acc.PositionUpdate -= OnAccountPositionUpdate;
+                    acc.OrderUpdate -= OnAccountOrderNoop;
+                    acc.ExecutionUpdate -= OnAccountExecutionNoop;
+                    acc.AccountItemUpdate -= OnAccountItemNoop;
+                    throw new InvalidOperationException("订阅账户失败(" + acc.Name + "): " + ex.Message, ex);
+                }
             }
         }
 
@@ -133,13 +145,34 @@ namespace NinjaTrader.NinjaScript.AddOns
                             MarketPosition = e.MarketPosition.ToString(),
                         };
                 }
+                lock (bracketLock)
+                    foreach (var p in pendingBrackets.Values)
+                        if (p.Acc == acc && p.Instrument == e.Position.Instrument.FullName && p.Entry.Filled > 0)
+                            p.PositionObserved = true;
+                QueueProtectionSync(acc);
             }
             catch { }
         }
 
         // 这三个事件只用于"激活"NT8 对该账户的跟踪,不需要处理内容
-        private void OnAccountOrderNoop(object sender, OrderEventArgs e) { }
-        private void OnAccountExecutionNoop(object sender, ExecutionEventArgs e) { }
+        private void OnAccountOrderNoop(object sender, OrderEventArgs e)
+        {
+            var acc = sender as Account;
+            if (acc == null || e.Order == null) return;
+            if (IsManagedProtection(e.Order) || e.Order.Name == "TV Entry")
+            {
+                if (IsManagedProtection(e.Order) && e.Order.OrderState == OrderState.Rejected)
+                    protectionErrors[acc.Name] = "止盈止损订单被拒绝: " + e.Order.OrderId + "。请在 NT8 检查订单。";
+                QueueProtectionSync(acc);
+            }
+        }
+        private void OnAccountExecutionNoop(object sender, ExecutionEventArgs e)
+        {
+            var acc = sender as Account;
+            // Take an immutable snapshot immediately; disk work never runs in NT8's execution handler.
+            CaptureExecution(acc, e == null ? null : e.Execution);
+            if (acc != null) QueueProtectionSync(acc);
+        }
         private void OnAccountItemNoop(object sender, AccountItemEventArgs e) { }
 
         private static long HistoryFloor(string instrFullName, int intervalSec)
@@ -168,14 +201,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             else if (State == State.Active)
             {
+                StartExecutionArchive();
                 StartServer();
             }
             else if (State == State.Terminated)
             {
                 StopServer();
+                StopExecutionArchive();
                 // 退订账户数据流,避免 NT8 侧挂着悬空调用
                 Account[] all;
-                lock (Account.All) all = Account.All.ToArray();
+                lock (subscribeLock) all = subscribedAccounts.ToArray();
                 foreach (var acc in all)
                 {
                     try
@@ -388,6 +423,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             string json = "{"
                 + "\"connected\":" + (connected ? "true" : "false") + ","
                 + "\"connectionName\":" + JsonQuote(connName) + ","
+                + "\"historyWindowVersion\":1,"
+                + "\"executionArchiveVersion\":1,\"archive\":" + ExecutionArchiveStatusJson() + ","
                 + "\"time\":" + ToUnix(DateTime.Now).ToString(CultureInfo.InvariantCulture)
                 + "}";
             WriteJson(ns, 200, json);
@@ -484,62 +521,73 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (instr == null) { WriteJson(ns, 404, "{\"error\":\"unknown symbol\"}"); return; }
 
             DateTime from = FromUnix(fromUnix);
-            DateTime to = toUnix > 0 ? FromUnix(toUnix) : DateTime.Now;
+            DateTime to = toUnix > 0 ? FromUnix(Math.Min(toUnix, ToUnix(DateTime.Now))) : DateTime.Now;
+            if (intervalSec <= 0 || fromUnix < 0 || (toUnix > 0 && fromUnix > toUnix))
+            { WriteJson(ns, 400, "{\"error\":\"invalid history range or interval\"}"); return; }
+            if (from > to) { WriteJson(ns, 200, "{\"bars\":[]}"); return; }
 
             BarsPeriod bp = BuildBarsPeriod(intervalSec);
             var tcs = new TaskCompletionSource<Bars>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            var request = new BarsRequest(instr, from, to) { BarsPeriod = bp };
-            // 回调第一个参数是 BarsRequest 本身,取 bar 要用 req.Bars
-            request.Request((req, errorCode, errorMessage) =>
+            // BarsRequest 按本地交易日截到午夜。覆盖两端会话后再按原窗口过滤,
+            // 否则同一自然日的 8h 请求可能返回 0 根,而宽窗能取到完整 481 根。
+            using (var request = new BarsRequest(instr, from.Date.AddDays(-1), to.Date.AddDays(1)) { BarsPeriod = bp })
             {
-                if (errorCode == ErrorCode.NoError) tcs.TrySetResult(req.Bars);
-                else tcs.TrySetException(new Exception(errorMessage ?? "BarsRequest failed"));
-            });
+                // 回调第一个参数是 BarsRequest 本身,取 bar 要用 req.Bars
+                request.Request((req, errorCode, errorMessage) =>
+                {
+                    if (errorCode == ErrorCode.NoError) tcs.TrySetResult(req.Bars);
+                    else tcs.TrySetException(new Exception(errorMessage ?? "BarsRequest failed"));
+                });
 
-            Bars result = null;
-            try
-            {
-                if (tcs.Task.Wait(TimeSpan.FromSeconds(20)))
-                    result = tcs.Task.Result;
-            }
-            catch { result = null; }
-            if (result == null) { WriteJson(ns, 504, "{\"error\":\"history timeout or request failed\"}"); return; }
+                Bars result = null;
+                try
+                {
+                    if (tcs.Task.Wait(TimeSpan.FromSeconds(20)))
+                        result = tcs.Task.Result;
+                }
+                catch (Exception ex)
+                {
+                    WriteJson(ns, 502, "{\"error\":" + JsonQuote("NT8 history: " + ex.GetBaseException().Message) + "}");
+                    return;
+                }
+                if (result == null) { WriteJson(ns, 504, "{\"error\":\"history timeout or request failed\"}"); return; }
 
-            var sb = new StringBuilder("{\"bars\":[");
-            int count = 0;
-            try { count = result.Count; } catch { }
-            // NT8 BarsRequest 按整天/会话取整,可能返回请求区间之外的 bar;
-            // 严格过滤到 [from,to]:图表库校验 "returned data should be in the
-            // requested range" 失败会升级为全量更新并反复重试(超量下载根因)
-            long fromU = ToUnix(from);
-            long toU = ToUnix(to);
-            bool firstBar = true;
-            long lastWritten = -1;
-            for (int i = 0; i < count; i++)
-            {
-                long bt = BarStartUnix(result, i, intervalSec);
-                if (bt < fromU || bt > toU) continue;
-                if (!firstBar) sb.Append(',');
-                firstBar = false;
-                lastWritten = bt;
-                sb.Append("{\"time\":").Append(bt.ToString(CultureInfo.InvariantCulture))
-                  .Append(",\"open\":").Append(F(result.GetOpen(i)))
-                  .Append(",\"high\":").Append(F(result.GetHigh(i)))
-                  .Append(",\"low\":").Append(F(result.GetLow(i)))
-                  .Append(",\"close\":").Append(F(result.GetClose(i)))
-                  .Append(",\"volume\":").Append(result.GetVolume(i).ToString(CultureInfo.InvariantCulture))
-                  .Append("}");
+                var sb = new StringBuilder("{\"bars\":[");
+                int count = 0;
+                try { count = result.Count; } catch { }
+                // NT8 BarsRequest 按整天/会话取整,可能返回请求区间之外的 bar;
+                // 严格过滤到 [from,to]:图表库校验 "returned data should be in the
+                // requested range" 失败会升级为全量更新并反复重试(超量下载根因)
+                long fromU = ToUnix(from);
+                long toU = ToUnix(to);
+                bool firstBar = true;
+                long lastWritten = -1;
+                for (int i = 0; i < count; i++)
+                {
+                    long bt = BarStartUnix(result, i, intervalSec);
+                    if (bt < fromU || bt > toU) continue;
+                    if (!firstBar) sb.Append(',');
+                    firstBar = false;
+                    lastWritten = bt;
+                    sb.Append("{\"time\":").Append(bt.ToString(CultureInfo.InvariantCulture))
+                      .Append(",\"open\":").Append(F(result.GetOpen(i)))
+                      .Append(",\"high\":").Append(F(result.GetHigh(i)))
+                      .Append(",\"low\":").Append(F(result.GetLow(i)))
+                      .Append(",\"close\":").Append(F(result.GetClose(i)))
+                      .Append(",\"volume\":").Append(result.GetVolume(i).ToString(CultureInfo.InvariantCulture))
+                      .Append("}");
+                }
+                sb.Append("]}");
+                // 历史末根 bar 时间登记为地平线:随后的实时流帧不得早于它
+                if (lastWritten > 0)
+                {
+                    string floorKey = instr.FullName + "|" + intervalSec;
+                    historyFloor.AddOrUpdate(floorKey, lastWritten,
+                        (_, old) => Math.Max(old, lastWritten));
+                }
+                WriteJson(ns, 200, sb.ToString());
             }
-            sb.Append("]}");
-            // 历史末根 bar 时间登记为地平线:随后的实时流帧不得早于它
-            if (lastWritten > 0)
-            {
-                string floorKey = instr.FullName + "|" + intervalSec;
-                historyFloor.AddOrUpdate(floorKey, lastWritten,
-                    (_, old) => Math.Max(old, lastWritten));
-            }
-            WriteJson(ns, 200, sb.ToString());
         }
 
         // SSE 实时流:订阅逐笔成交,聚合成 intervalSec 周期的当前 bar,每个 tick 推送一次
@@ -601,17 +649,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 else
                     instrument.MarketData.Update += OnMarketData;
 
-                // 立即推送最近成交价更新当前 bar 的 close,避免切换合约后
-                // 一直等下一笔 tick 才刷新(种子已就位,不会污染 open)
-                // 用 DateTime.Now 而非 last.Time:陈旧成交时间会让快照 bar
-                // 落后于图表已有 bar,触发 time order violation 被库丢弃
-                try
-                {
-                    var last = instrument.MarketData.Last;
-                    if (last != null && last.Price > 0)
-                        EmitTick(DateTime.Now, last.Price, 0);
-                }
-                catch { }
+                // 直接推送 NT8 的真实种子。休市期间不能把陈旧 Last 伪装成当前 tick。
+                lock (sync) { if (bucket >= 0) WriteFrameLocked(); }
             }
 
             // 同步拉取当前周期最后一根 bar 作为种子;失败则退回 epoch 网格的旧行为
@@ -621,26 +660,28 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     DateTime now = DateTime.Now;
                     var tcs = new TaskCompletionSource<Bars>(TaskCreationOptions.RunContinuationsAsynchronously);
-                    var req = new BarsRequest(instrument, now.AddSeconds(-10.0 * intervalSec), now)
-                        { BarsPeriod = BuildBarsPeriod(intervalSec) };
-                    req.Request((r, ec, em) =>
+                    using (var req = new BarsRequest(instrument, now.AddSeconds(-10.0 * intervalSec).Date.AddDays(-1), now.Date.AddDays(1))
+                        { BarsPeriod = BuildBarsPeriod(intervalSec) })
                     {
-                        if (ec == ErrorCode.NoError) tcs.TrySetResult(r.Bars);
-                        else tcs.TrySetException(new Exception(em ?? "BarsRequest failed"));
-                    });
-                    if (!tcs.Task.Wait(TimeSpan.FromSeconds(10))) return;
-                    Bars bars = tcs.Task.Result;
-                    int n = bars != null ? bars.Count : 0;
-                    if (n <= 0) return;
-                    lock (sync)
-                    {
-                        // 末根是未收盘 bar,OHLCV 用它的值,时间换算成左端点
-                        bucket = BarStartUnix(bars, n - 1, intervalSec);
-                        open = bars.GetOpen(n - 1);
-                        high = bars.GetHigh(n - 1);
-                        low = bars.GetLow(n - 1);
-                        close = bars.GetClose(n - 1);
-                        volume = bars.GetVolume(n - 1);
+                        req.Request((r, ec, em) =>
+                        {
+                            if (ec == ErrorCode.NoError) tcs.TrySetResult(r.Bars);
+                            else tcs.TrySetException(new Exception(em ?? "BarsRequest failed"));
+                        });
+                        if (!tcs.Task.Wait(TimeSpan.FromSeconds(10))) return;
+                        Bars bars = tcs.Task.Result;
+                        int n = bars != null ? bars.Count : 0;
+                        if (n <= 0) return;
+                        lock (sync)
+                        {
+                            // 末根是未收盘 bar,OHLCV 用它的值,时间换算成左端点
+                            bucket = BarStartUnix(bars, n - 1, intervalSec);
+                            open = bars.GetOpen(n - 1);
+                            high = bars.GetHigh(n - 1);
+                            low = bars.GetLow(n - 1);
+                            close = bars.GetClose(n - 1);
+                            volume = bars.GetVolume(n - 1);
+                        }
                     }
                 }
                 catch { }
@@ -702,6 +743,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // 用当前累积值写一帧;调用方必须已持有 sync
             private void WriteFrameLocked()
             {
+                if (bucket < HistoryFloor(instrument.FullName, intervalSec)) return;
                 string frame = "data: {\"time\":" + bucket.ToString(CultureInfo.InvariantCulture)
                     + ",\"open\":" + F(open) + ",\"high\":" + F(high)
                     + ",\"low\":" + F(low) + ",\"close\":" + F(close)
@@ -723,27 +765,29 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     DateTime now = DateTime.Now;
                     var tcs = new TaskCompletionSource<Bars>(TaskCreationOptions.RunContinuationsAsynchronously);
-                    var req = new BarsRequest(instrument, now.AddSeconds(-10.0 * intervalSec), now)
-                        { BarsPeriod = BuildBarsPeriod(intervalSec) };
-                    req.Request((r, ec, em) =>
+                    using (var req = new BarsRequest(instrument, now.AddSeconds(-10.0 * intervalSec).Date.AddDays(-1), now.Date.AddDays(1))
+                        { BarsPeriod = BuildBarsPeriod(intervalSec) })
                     {
-                        if (ec == ErrorCode.NoError) tcs.TrySetResult(r.Bars);
-                        else tcs.TrySetException(new Exception(em ?? "BarsRequest failed"));
-                    });
-                    if (!tcs.Task.Wait(TimeSpan.FromSeconds(10))) return;
-                    Bars bars = tcs.Task.Result;
-                    int n = bars != null ? bars.Count : 0;
-                    if (n <= 0) return;
-                    lock (sync)
-                    {
-                        // 末根是未收盘 bar,OHLCV 用它的值,时间换算成左端点
-                        bucket = BarStartUnix(bars, n - 1, intervalSec);
-                        open = bars.GetOpen(n - 1);
-                        high = bars.GetHigh(n - 1);
-                        low = bars.GetLow(n - 1);
-                        close = bars.GetClose(n - 1);
-                        volume = bars.GetVolume(n - 1);
-                        WriteFrameLocked();   // 立即推一帧,让图表换到/修正当前 bar
+                        req.Request((r, ec, em) =>
+                        {
+                            if (ec == ErrorCode.NoError) tcs.TrySetResult(r.Bars);
+                            else tcs.TrySetException(new Exception(em ?? "BarsRequest failed"));
+                        });
+                        if (!tcs.Task.Wait(TimeSpan.FromSeconds(10))) return;
+                        Bars bars = tcs.Task.Result;
+                        int n = bars != null ? bars.Count : 0;
+                        if (n <= 0) return;
+                        lock (sync)
+                        {
+                            // 末根是未收盘 bar,OHLCV 用它的值,时间换算成左端点
+                            bucket = BarStartUnix(bars, n - 1, intervalSec);
+                            open = bars.GetOpen(n - 1);
+                            high = bars.GetHigh(n - 1);
+                            low = bars.GetLow(n - 1);
+                            close = bars.GetClose(n - 1);
+                            volume = bars.GetVolume(n - 1);
+                            WriteFrameLocked();   // 立即推一帧,让图表换到/修正当前 bar
+                        }
                     }
                 }
                 catch { }
@@ -1050,60 +1094,378 @@ namespace NinjaTrader.NinjaScript.AddOns
             WriteJson(ns, 200, sb.ToString());
         }
 
-        // GET /api/executions?account=&symbol=&from=&to= -> 成交历史(图上 marks 用)
-        // NT8 的成交/订单记录存在本地数据库,默认永久保留(除非手动清库);
-        // 这里按请求区间过滤,最多返回最近 200 条
+        // BEGIN EXECUTION_ARCHIVE (also compiled by the isolated journal regression runner)
+        private sealed class ArchivedExecution
+        {
+            public string Account, Instrument, ExecutionId, OrderId, Side, Currency;
+            public long Time, TimeTicks;
+            public int Quantity;
+            public double Price;
+            public double? Commission, PointValue;
+
+            public string Key
+            {
+                get { return Account.ToUpperInvariant() + "\n" + ExecutionId; }
+            }
+
+            private static string Encode(string value) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(value ?? "")); }
+            private static string Decode(string value) { return Encoding.UTF8.GetString(Convert.FromBase64String(value)); }
+            private static string Number(double? value) { return value.HasValue ? value.Value.ToString("R", CultureInfo.InvariantCulture) : ""; }
+            private static double? ReadNumber(string value)
+            {
+                if (value.Length == 0) return null;
+                double result = double.Parse(value, CultureInfo.InvariantCulture);
+                if (double.IsNaN(result) || double.IsInfinity(result)) throw new FormatException("Invalid number");
+                return result;
+            }
+
+            public string Payload()
+            {
+                return string.Join("\t", new[] { "1", Encode(Account), Encode(Instrument), Encode(ExecutionId), Encode(OrderId),
+                    Side, Time.ToString(CultureInfo.InvariantCulture), TimeTicks.ToString(CultureInfo.InvariantCulture),
+                    Quantity.ToString(CultureInfo.InvariantCulture), Price.ToString("R", CultureInfo.InvariantCulture),
+                    Number(Commission), Number(PointValue), Encode(Currency) });
+            }
+
+            private static string Checksum(string payload)
+            {
+                using (var sha = SHA256.Create())
+                    return Convert.ToBase64String(sha.ComputeHash(Encoding.UTF8.GetBytes(payload)));
+            }
+
+            public string JournalLine() { string payload = Payload(); return payload + "\t" + Checksum(payload); }
+
+            public static ArchivedExecution Read(string line)
+            {
+                int split = line.LastIndexOf('\t');
+                if (split < 0) throw new FormatException("Missing checksum");
+                string payload = line.Substring(0, split);
+                if (!string.Equals(Checksum(payload), line.Substring(split + 1), StringComparison.Ordinal))
+                    throw new FormatException("Checksum mismatch");
+                string[] parts = payload.Split('\t');
+                if (parts.Length != 13 || parts[0] != "1") throw new FormatException("Unknown journal version");
+                var record = new ArchivedExecution {
+                    Account = Decode(parts[1]), Instrument = Decode(parts[2]), ExecutionId = Decode(parts[3]), OrderId = Decode(parts[4]),
+                    Side = parts[5], Time = long.Parse(parts[6], CultureInfo.InvariantCulture), TimeTicks = long.Parse(parts[7], CultureInfo.InvariantCulture),
+                    Quantity = int.Parse(parts[8], CultureInfo.InvariantCulture), Price = ReadNumber(parts[9]) ?? double.NaN,
+                    Commission = ReadNumber(parts[10]), PointValue = ReadNumber(parts[11]), Currency = Decode(parts[12])
+                };
+                if (record.Account.Length == 0 || record.ExecutionId.Length == 0 || record.Quantity <= 0 || double.IsNaN(record.Price)
+                    || (record.Side != "Buy" && record.Side != "Sell" && record.Side != "Unknown")) throw new FormatException("Invalid execution");
+                return record;
+            }
+
+            public string Json()
+            {
+                return "{\"account\":" + JsonQuote(Account) + ",\"instrument\":" + JsonQuote(Instrument)
+                    + ",\"executionId\":" + JsonQuote(ExecutionId) + ",\"orderId\":" + JsonQuote(OrderId)
+                    + ",\"time\":" + Time.ToString(CultureInfo.InvariantCulture)
+                    + ",\"timeMs\":" + F((TimeTicks - 621355968000000000L) / 10000.0) + ",\"price\":" + F(Price)
+                    + ",\"qty\":" + Quantity.ToString(CultureInfo.InvariantCulture) + ",\"side\":" + JsonQuote(Side)
+                    + ",\"commission\":" + (Commission.HasValue ? F(Commission.Value) : "null")
+                    + ",\"pointValue\":" + (PointValue.HasValue ? F(PointValue.Value) : "null")
+                    + ",\"currency\":" + JsonQuote(Currency) + "}";
+            }
+        }
+
+        private sealed class ExecutionJournal
+        {
+            public readonly string Path;
+            private readonly object gate = new object();
+            private readonly Dictionary<string, ArchivedExecution> records = new Dictionary<string, ArchivedExecution>(StringComparer.Ordinal);
+            private readonly Dictionary<string, ArchivedExecution> dirty = new Dictionary<string, ArchivedExecution>(StringComparer.Ordinal);
+            public volatile bool Loaded;
+            public string Error = "", Warning = "";
+            public long LastSavedAt;
+
+            public ExecutionJournal(string path) { Path = path; }
+
+            public bool Load()
+            {
+                if (Loaded) return true;
+                try
+                {
+                    Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path));
+                    int invalid = 0;
+                    if (File.Exists(Path))
+                        using (var stream = new FileStream(Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        using (var reader = new StreamReader(stream, Encoding.UTF8))
+                        {
+                            string line;
+                            while ((line = reader.ReadLine()) != null)
+                            {
+                                if (line.Length == 0) continue;
+                                try
+                                {
+                                    var row = ArchivedExecution.Read(line);
+                                    lock (gate) records[row.Key] = row;
+                                }
+                                catch (FormatException) { invalid++; }
+                                catch (OverflowException) { invalid++; }
+                            }
+                        }
+                    Warning = invalid == 0 ? "" : "成交归档中有 " + invalid + " 条不完整或校验失败的记录；原始内容保留，其他记录已恢复。";
+                    if (File.Exists(Path)) LastSavedAt = ToUnix(File.GetLastWriteTimeUtc(Path));
+                    Error = "";
+                    Loaded = true;
+                    return true;
+                }
+                catch (Exception ex) { Error = "读取成交归档失败: " + ex.Message; return false; }
+            }
+
+            public void Upsert(ArchivedExecution row)
+            {
+                lock (gate)
+                {
+                    ArchivedExecution previous;
+                    if (records.TryGetValue(row.Key, out previous))
+                    {
+                        // An early event may omit details. Later execution/commission updates enrich the same fill.
+                        // A zero commission is a real value and can correct an earlier nonzero commission.
+                        if (!row.Commission.HasValue) row.Commission = previous.Commission;
+                        if (!row.PointValue.HasValue) row.PointValue = previous.PointValue;
+                        if (string.IsNullOrEmpty(row.Currency)) row.Currency = previous.Currency;
+                        if (string.IsNullOrEmpty(row.Instrument)) row.Instrument = previous.Instrument;
+                        if (string.IsNullOrEmpty(row.OrderId)) row.OrderId = previous.OrderId;
+                        if (row.Side == "Unknown" && previous.Side != "Unknown") row.Side = previous.Side;
+                        if (previous.Payload() == row.Payload()) return;
+                    }
+                    records[row.Key] = row;
+                    dirty[row.Key] = row;
+                }
+            }
+
+            public ArchivedExecution[] Snapshot() { lock (gate) return records.Values.ToArray(); }
+            public int Count { get { lock (gate) return records.Count; } }
+            public int PendingCount { get { lock (gate) return dirty.Count; } }
+
+            public bool Flush()
+            {
+                if (!Loaded) return false;
+                ArchivedExecution[] batch;
+                lock (gate) batch = dirty.Values.ToArray();
+                if (batch.Length == 0) return true;
+                try
+                {
+                    using (var stream = new FileStream(Path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read))
+                    {
+                        // Preserve crash-damaged bytes; separate the next valid record without truncating history.
+                        if (stream.Length > 0)
+                        {
+                            stream.Seek(-1, SeekOrigin.End);
+                            if (stream.ReadByte() != '\n') stream.WriteByte((byte)'\n');
+                        }
+                        stream.Seek(0, SeekOrigin.End);
+                        foreach (var row in batch)
+                        {
+                            byte[] bytes = Encoding.UTF8.GetBytes(row.JournalLine() + "\n");
+                            stream.Write(bytes, 0, bytes.Length);
+                        }
+                        stream.Flush(true);
+                    }
+                    lock (gate)
+                        foreach (var row in batch)
+                        {
+                            ArchivedExecution current;
+                            if (dirty.TryGetValue(row.Key, out current) && ReferenceEquals(current, row)) dirty.Remove(row.Key);
+                        }
+                    LastSavedAt = ToUnix(DateTime.UtcNow);
+                    Error = "";
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    // Retain the whole batch for retry. Repeated valid lines are idempotent on restart.
+                    Error = "保存成交归档失败，待保存记录仍保留在内存并自动重试: " + ex.Message;
+                    return false;
+                }
+            }
+        }
+        // END EXECUTION_ARCHIVE
+
+        private ExecutionJournal executionJournal;
+        private readonly ConcurrentQueue<ArchivedExecution> executionQueue = new ConcurrentQueue<ArchivedExecution>();
+        private readonly AutoResetEvent executionWake = new AutoResetEvent(false);
+        private Thread executionThread;
+        private volatile bool executionArchiveRunning;
+        private string executionCaptureError = "", executionScanError = "";
+
+        private void StartExecutionArchive()
+        {
+            if (executionArchiveRunning) return;
+            executionJournal = new ExecutionJournal(System.IO.Path.Combine(Core.Globals.UserDataDir, "TvBridge", "executions-v1.log"));
+            executionArchiveRunning = true;
+            executionThread = new Thread(ExecutionArchiveLoop) { IsBackground = true, Name = "TvBridgeExecutions" };
+            executionThread.Start();
+        }
+
+        private void StopExecutionArchive()
+        {
+            executionArchiveRunning = false;
+            executionWake.Set();
+            if (executionThread != null && !executionThread.Join(5000))
+                NinjaTrader.Code.Output.Process("TvBridge: 成交归档仍在完成磁盘写入。", PrintTo.OutputTab1);
+            if (executionJournal != null && (executionJournal.PendingCount > 0 || !executionQueue.IsEmpty))
+                NinjaTrader.Code.Output.Process("TvBridge: 成交归档存在尚未保存的数据。" + executionJournal.Error, PrintTo.OutputTab1);
+        }
+
+        private void CaptureExecution(Account account, Execution execution)
+        {
+            if (account == null || execution == null || !executionArchiveRunning) return;
+            try
+            {
+                // Execution.MarketPosition describes the fill direction, not the resulting account position.
+                // A sell closing a long is Short; do not invert it based on IsEntry.
+                string side = "Unknown";
+                if (execution.Order != null)
+                {
+                    var action = execution.Order.OrderAction;
+                    if (action == OrderAction.Buy || action == OrderAction.BuyToCover) side = "Buy";
+                    else if (action == OrderAction.Sell || action == OrderAction.SellShort) side = "Sell";
+                }
+                if (side == "Unknown")
+                {
+                    if (execution.MarketPosition == MarketPosition.Long) side = "Buy";
+                    else if (execution.MarketPosition == MarketPosition.Short) side = "Sell";
+                }
+                var row = new ArchivedExecution {
+                    Account = account.Name, Instrument = execution.Instrument == null ? "" : execution.Instrument.FullName,
+                    ExecutionId = execution.ExecutionId ?? "", OrderId = execution.OrderId ?? "", Side = side,
+                    Time = ToUnix(execution.Time), TimeTicks = execution.Time.ToUniversalTime().Ticks,
+                    Quantity = execution.Quantity, Price = execution.Price, Currency = ""
+                };
+                if (row.Quantity <= 0) return;
+                if (double.IsNaN(row.Price) || double.IsInfinity(row.Price)) throw new InvalidOperationException("Invalid execution price");
+                try { double commission = execution.Commission; if (!double.IsNaN(commission) && !double.IsInfinity(commission)) row.Commission = commission; } catch { }
+                try { double pointValue = execution.Instrument.MasterInstrument.PointValue; if (pointValue > 0 && !double.IsInfinity(pointValue)) row.PointValue = pointValue; } catch { }
+                try { row.Currency = NormalizeCurrency(account.Denomination.ToString()); } catch { }
+                if (row.ExecutionId.Length == 0)
+                    row.ExecutionId = "fallback:" + row.OrderId + ":" + row.Instrument + ":" + row.TimeTicks.ToString(CultureInfo.InvariantCulture)
+                        + ":" + row.Side + ":" + row.Quantity.ToString(CultureInfo.InvariantCulture) + ":" + F(row.Price);
+                executionQueue.Enqueue(row);
+                executionWake.Set();
+            }
+            catch (Exception ex) { executionCaptureError = "采集成交失败(" + account.Name + "): " + ex.Message; }
+        }
+
+        private static string NormalizeCurrency(string currency)
+        {
+            switch (currency)
+            {
+                case "UsDollar": return "USD";
+                case "Euro": return "EUR";
+                case "BritishPound": return "GBP";
+                case "JapaneseYen": return "JPY";
+                case "CanadianDollar": return "CAD";
+                case "AustralianDollar": return "AUD";
+                case "SwissFranc": return "CHF";
+                case "HongKongDollar": return "HKD";
+                case "NewZealandDollar": return "NZD";
+                default: return currency;
+            }
+        }
+
+        private void DiscoverExecutionAccounts()
+        {
+            try
+            {
+                Account[] accounts;
+                lock (Account.All) accounts = Account.All.ToArray();
+                var errors = new List<string>();
+                foreach (var account in accounts)
+                {
+                    try
+                    {
+                        EnsureSubscribed(account);
+                        // During a disk read failure keep subscribing to new events, but do not enqueue
+                        // the same entire account snapshot every retry and grow the queue without bound.
+                        if (!executionJournal.Loaded) continue;
+                        Execution[] snapshot;
+                        lock (account.Executions) snapshot = account.Executions.ToArray();
+                        foreach (var execution in snapshot) CaptureExecution(account, execution);
+                    }
+                    catch (Exception ex) { errors.Add(account.Name + ": " + ex.Message); }
+                }
+                executionScanError = string.Join("; ", errors);
+            }
+            catch (Exception ex) { executionScanError = "扫描账户成交失败: " + ex.Message; }
+        }
+
+        private void ExecutionArchiveLoop()
+        {
+            DateTime nextScan = DateTime.MinValue;
+            string reportedError = "";
+            while (executionArchiveRunning)
+            {
+                if (DateTime.UtcNow >= nextScan)
+                {
+                    DiscoverExecutionAccounts();
+                    nextScan = DateTime.UtcNow.AddSeconds(5);
+                }
+                bool previouslyLoaded = executionJournal.Loaded;
+                if (executionJournal.Load())
+                {
+                    if (!previouslyLoaded) nextScan = DateTime.MinValue;
+                    ArchivedExecution record;
+                    while (executionQueue.TryDequeue(out record)) executionJournal.Upsert(record);
+                    executionJournal.Flush();
+                }
+                string currentError = executionJournal.Error + executionCaptureError + executionScanError;
+                if (currentError.Length > 0 && currentError != reportedError)
+                    NinjaTrader.Code.Output.Process("TvBridge 成交归档: " + currentError, PrintTo.OutputTab1);
+                reportedError = currentError;
+                executionWake.WaitOne(executionJournal.Error.Length > 0 ? 2000 : 250);
+            }
+            if (executionJournal.Load())
+            {
+                ArchivedExecution record;
+                while (executionQueue.TryDequeue(out record)) executionJournal.Upsert(record);
+                executionJournal.Flush();
+            }
+        }
+
+        private string ExecutionArchiveStatusJson()
+        {
+            var journal = executionJournal;
+            string error = string.Join("; ", new[] { journal == null ? "" : journal.Error, executionCaptureError, executionScanError }.Where(e => e.Length > 0));
+            return "{\"version\":1,\"state\":" + JsonQuote(error.Length > 0 ? "error" : journal != null && journal.Loaded ? "ready" : "loading")
+                + ",\"path\":" + JsonQuote(journal == null ? "" : journal.Path)
+                + ",\"recordCount\":" + (journal == null ? 0 : journal.Count).ToString(CultureInfo.InvariantCulture)
+                + ",\"pendingCount\":" + ((journal == null ? 0 : journal.PendingCount) + executionQueue.Count).ToString(CultureInfo.InvariantCulture)
+                + ",\"lastSavedAt\":" + (journal == null ? 0 : Interlocked.Read(ref journal.LastSavedAt)).ToString(CultureInfo.InvariantCulture)
+                + ",\"error\":" + JsonQuote(error) + ",\"warning\":" + JsonQuote(journal == null ? "" : journal.Warning) + "}";
+        }
+
+        // account/symbol are optional, including accounts no longer connected to NT8.
+        // Paged responses are newest first; legacy chart requests keep the latest 200 in ascending order.
         private void HandleExecutions(NetworkStream ns, Dictionary<string, string> q)
         {
-            string accName;
-            if (!q.TryGetValue("account", out accName)) { WriteJson(ns, 400, "{\"error\":\"missing account\"}"); return; }
-            Account acc = FindAccount(accName);
-            if (acc == null) { WriteJson(ns, 404, "{\"error\":\"unknown account\"}"); return; }
-
-            string symbol = q.ContainsKey("symbol") ? q["symbol"] : "";
+            string accName = Get(q, "account"), symbol = Get(q, "symbol");
             long fromU = q.ContainsKey("from") ? ParseLong(q["from"], 0) : 0;
             long toU = q.ContainsKey("to") ? ParseLong(q["to"], long.MaxValue) : long.MaxValue;
 
-            Execution[] snapshot;
-            try { snapshot = acc.Executions.ToArray(); } catch { snapshot = new Execution[0]; }
-
-            var filtered = new List<Execution>();
-            foreach (var e in snapshot)
-            {
-                if (!string.IsNullOrEmpty(symbol) && (e.Instrument == null || e.Instrument.FullName != symbol)) continue;
-                long t;
-                try { t = ToUnix(e.Time); } catch { continue; }
-                if (t < fromU || t > toU) continue;
-                filtered.Add(e);
-            }
-            // 时间升序后取最近 200 条,防止超大区间撑爆响应
-            var list = filtered.OrderBy(e => e.Time).Skip(Math.Max(0, filtered.Count - 200));
+            ArchivedExecution[] snapshot = executionJournal == null ? new ArchivedExecution[0] : executionJournal.Snapshot();
+            var filtered = snapshot.Where(e => (accName.Length == 0 || string.Equals(e.Account, accName, StringComparison.OrdinalIgnoreCase))
+                && (symbol.Length == 0 || e.Instrument == symbol) && e.Time >= fromU && e.Time <= toU).ToArray();
+            bool paged = q.ContainsKey("offset") || q.ContainsKey("limit");
+            int offset = Math.Max(0, ParseInt(Get(q, "offset"), 0));
+            int limit = Math.Max(1, Math.Min(500, ParseInt(Get(q, "limit"), 100)));
+            var list = paged
+                ? filtered.OrderByDescending(e => e.TimeTicks).ThenBy(e => e.Account, StringComparer.Ordinal).ThenBy(e => e.ExecutionId, StringComparer.Ordinal).Skip(offset).Take(limit)
+                : filtered.OrderBy(e => e.TimeTicks).ThenBy(e => e.Account, StringComparer.Ordinal).ThenBy(e => e.ExecutionId, StringComparer.Ordinal).Skip(Math.Max(0, filtered.Length - 200));
 
             var sb = new StringBuilder("{\"executions\":[");
             bool first = true;
             foreach (var e in list)
             {
-                // 买卖方向:优先取订单动作;Order 缺失时由 入场/持仓方向 推断
-                // (入场+多 / 出场+空 = Buy;入场+空 / 出场+多 = Sell)
-                string side;
-                try
-                {
-                    if (e.Order != null)
-                        side = e.Order.OrderAction == OrderAction.Buy ? "Buy" : "Sell";
-                    else
-                        side = e.IsEntry == (e.MarketPosition == MarketPosition.Long) ? "Buy" : "Sell";
-                }
-                catch { side = "Buy"; }
                 if (!first) sb.Append(',');
                 first = false;
-                sb.Append("{\"time\":").Append(ToUnix(e.Time).ToString(CultureInfo.InvariantCulture))
-                  .Append(",\"price\":").Append(F(e.Price))
-                  .Append(",\"qty\":").Append(e.Quantity.ToString(CultureInfo.InvariantCulture))
-                  .Append(",\"side\":").Append(JsonQuote(side))
-                  .Append(",\"orderId\":").Append(JsonQuote(e.OrderId ?? ""))
-                  .Append("}");
+                sb.Append(e.Json());
             }
-            sb.Append("]}");
+            sb.Append("],\"total\":").Append(filtered.Length);
+            if (paged)
+                sb.Append(",\"nextOffset\":").Append((long)offset + limit < filtered.Length ? (offset + limit).ToString(CultureInfo.InvariantCulture) : "null");
+            sb.Append(",\"archive\":").Append(ExecutionArchiveStatusJson()).Append("}");
             WriteJson(ns, 200, sb.ToString());
         }
 
@@ -1116,31 +1478,23 @@ namespace NinjaTrader.NinjaScript.AddOns
             var sb = new StringBuilder("{\"brackets\":[");
             lock (bracketLock)
             {
-                // 先清理:入场单已成交(括号单已真正挂出)/撤销/拒绝的注册项
-                var stale = new List<string>();
-                foreach (var kv in pendingBrackets)
-                {
-                    Order o = null;
-                    try { o = kv.Value.Acc.Orders.FirstOrDefault(x => x.OrderId == kv.Key); }
-                    catch { }
-                    if (o == null || !IsWorkingState(o.OrderState)) stale.Add(kv.Key);
-                }
-                foreach (var k in stale) pendingBrackets.Remove(k);
-
                 bool first = true;
                 foreach (var kv in pendingBrackets)
                 {
                     if (accName.Length > 0 && kv.Value.Acc.Name != accName) continue;
+                    if (!IsWorkingState(kv.Key.OrderState)) continue;
                     if (!first) sb.Append(',');
                     first = false;
-                    sb.Append("{\"entryOrderId\":").Append(JsonQuote(kv.Key))
+                    sb.Append("{\"entryOrderId\":").Append(JsonQuote(kv.Value.Entry.OrderId ?? ""))
                       .Append(",\"instrument\":").Append(JsonQuote(kv.Value.Instrument ?? ""))
                       .Append(",\"tp\":").Append(F(kv.Value.Tp))
                       .Append(",\"sl\":").Append(F(kv.Value.Sl))
                       .Append("}");
                 }
             }
-            sb.Append("]}");
+            string syncError;
+            protectionErrors.TryGetValue(accName, out syncError);
+            sb.Append("],\"syncError\":").Append(JsonQuote(syncError ?? "")).Append("}");
             WriteJson(ns, 200, sb.ToString());
         }
 
@@ -1201,85 +1555,162 @@ namespace NinjaTrader.NinjaScript.AddOns
         // 入场单成交后自动挂 OCO 止盈(限价)+ 止损(市价止损)。
         // tp/sl 为绝对价(LMT/STP 场景);tpAmount/slAmount 为美元金额(MKT 场景),
         // 金额模式在成交瞬间取实际成交均价换算目标价,保证金额风险不受滑点影响
+        // Register before Submit using the Order object: some providers assign/change OrderId on submission.
         private void RegisterBracketOnFill(Account acc, Instrument instr, OrderAction entryAction,
             int qty, double tp, double sl, double tpAmount, double slAmount, Order entry, TimeInForce tif)
         {
-            // 注册待触发括号单,供 /api/brackets 查询(入场单成交前止盈止损价只存在这里)
+            lock (bracketLock)
+                pendingBrackets[entry] = new PendingBracket { Acc = acc, Entry = entry,
+                    Instrument = instr.FullName, Tp = tp, Sl = sl, TpAmount = tpAmount, SlAmount = slAmount };
+        }
+
+        private static bool IsManagedProtection(Order o)
+        {
+            return o != null && !string.IsNullOrEmpty(o.Oco) && (o.Name == "TV TP" || o.Name == "TV SL");
+        }
+
+        // One worker per account. NT8 callbacks can arrive in different orders; wait for the current
+        // event batch, then read the latest position. A subsequent event always schedules another pass.
+        private void QueueProtectionSync(Account acc)
+        {
             lock (bracketLock)
             {
-                pendingBrackets[entry.OrderId ?? ""] = new PendingBracket
+                long rev;
+                protectionRevisions.TryGetValue(acc, out rev);
+                protectionRevisions[acc] = rev + 1;
+                if (!protectionWorkers.Add(acc)) return;
+            }
+            Task.Run(async () =>
+            {
+                while (running)
                 {
-                    Acc = acc,
-                    Instrument = instr != null ? instr.FullName : "",
-                    Tp = tp,
-                    Sl = sl,
-                };
+                    await Task.Delay(75);
+                    if (!running) break;
+                    long revision;
+                    lock (bracketLock) revision = protectionRevisions[acc];
+                    try { ReconcileProtection(acc); }
+                    catch (Exception ex)
+                    {
+                        protectionErrors[acc.Name] = "止盈止损数量同步失败: " + ex.GetBaseException().Message;
+                        NinjaTrader.Code.Output.Process("TvBridge " + protectionErrors[acc.Name], PrintTo.OutputTab1);
+                    }
+                    lock (bracketLock)
+                    {
+                        if (protectionRevisions[acc] != revision) continue;
+                        protectionWorkers.Remove(acc);
+                        return;
+                    }
+                }
+                lock (bracketLock) protectionWorkers.Remove(acc);
+            });
+        }
+
+        private void ReconcileProtection(Account acc)
+        {
+            Order[] snapshot;
+            Position[] positions;
+            lock (acc.Orders) snapshot = acc.Orders.ToArray();
+            lock (acc.Positions) positions = acc.Positions.ToArray();
+            var quantities = new Dictionary<string, int>();
+            lock (positionCache)
+                foreach (var kv in positionCache)
+                    if (kv.Key.StartsWith(acc.Name + "|", StringComparison.Ordinal))
+                        quantities[kv.Key.Substring(acc.Name.Length + 1)] = kv.Value.Quantity;
+            foreach (var p in positions)
+                if (p.Instrument != null)
+                    quantities[p.Instrument.FullName] = p.MarketPosition == MarketPosition.Flat ? 0
+                        : p.Quantity * (p.MarketPosition == MarketPosition.Long ? 1 : -1);
+
+            var managed = snapshot.Where(o => IsManagedProtection(o) && IsWorkingState(o.OrderState)).ToList();
+            PendingBracket[] pending;
+            lock (bracketLock) pending = pendingBrackets.Values.Where(p => p.Acc == acc).ToArray();
+            foreach (var p in pending)
+            {
+                int signed;
+                quantities.TryGetValue(p.Instrument, out signed);
+                int direction = p.Entry.OrderAction == OrderAction.Buy ? 1 : -1;
+                if (!p.Activated && p.Entry.Filled > 0 && signed * direction > 0)
+                {
+                    // Existing protection keeps its prices when adding to a position, including
+                    // entries with another bracket preset. Do not create a second full-size OCO pair.
+                    bool covered = managed.Any(o => o.Instrument.FullName == p.Instrument
+                        && (o.OrderAction == OrderAction.Buy ? -1 : 1) == direction
+                        && o.OrderState != OrderState.CancelPending && o.OrderState != OrderState.CancelSubmitted);
+                    if (!covered)
+                    {
+                        var instr = p.Entry.Instrument;
+                        double fill = p.Entry.AverageFillPrice;
+                        double pv = instr.MasterInstrument.PointValue;
+                        double tp = p.Tp, sl = p.Sl;
+                        if (pv <= 0 || fill <= 0) throw new Exception("无法读取入场均价/合约点值");
+                        if (p.TpAmount > 0) tp = instr.MasterInstrument.RoundToTickSize(fill + direction * p.TpAmount / (pv * p.Entry.Quantity));
+                        if (p.SlAmount > 0) sl = instr.MasterInstrument.RoundToTickSize(fill - direction * p.SlAmount / (pv * p.Entry.Quantity));
+                        string oco = "tv" + Guid.NewGuid().ToString("N");
+                        OrderAction exit = direction > 0 ? OrderAction.Sell : OrderAction.Buy;
+                        var created = new List<Order>();
+                        if (tp > 0) created.Add(acc.CreateOrder(instr, exit, OrderType.Limit, OrderEntry.Manual,
+                            p.Entry.TimeInForce, Math.Abs(signed), tp, 0, oco, "TV TP", Core.Globals.MaxDate, null));
+                        if (sl > 0) created.Add(acc.CreateOrder(instr, exit, OrderType.StopMarket, OrderEntry.Manual,
+                            p.Entry.TimeInForce, Math.Abs(signed), 0, sl, oco, "TV SL", Core.Globals.MaxDate, null));
+                        if (created.Any(o => o == null)) throw new Exception("CreateOrder 创建保护单失败");
+                        // Mark before submission to prevent retries from duplicating an accepted leg.
+                        p.Activated = true;
+                        if (created.Count > 0) acc.Submit(created.ToArray());
+                        managed.AddRange(created);
+                    }
+                    else p.Activated = true;
+                }
+                if (!IsWorkingState(p.Entry.OrderState) && (p.Activated || p.Entry.Filled == 0
+                    || (p.PositionObserved && signed * direction <= 0)))
+                    lock (bracketLock) pendingBrackets.Remove(p.Entry);
             }
 
-            EventHandler<ExecutionEventArgs> handler = null;
-            handler = (s, e) =>
+            foreach (var instrumentOrders in managed.GroupBy(o => o.Instrument.FullName))
             {
-                try
+                int signed;
+                quantities.TryGetValue(instrumentOrders.Key, out signed);
+                var matching = new List<Order>();
+                foreach (var o in instrumentOrders)
                 {
-                    if (e.Execution == null || e.Execution.Order != entry) return;
-                    if (e.Execution.Order.OrderState != OrderState.Filled) return;
-                    acc.ExecutionUpdate -= handler;
-                    lock (bracketLock) { pendingBrackets.Remove(entry.OrderId ?? ""); }
-
-                    int filledQty = e.Execution.Order.Filled > 0 ? e.Execution.Order.Filled : qty;
-                    OrderAction exit = entryAction == OrderAction.Buy ? OrderAction.Sell : OrderAction.Buy;
-
-                    // 金额模式:按实际成交均价换算止盈/止损价(与前端 draftCalc.amountToPrice 同公式)
-                    double tpPrice = tp, slPrice = sl;
-                    if (tpAmount > 0 || slAmount > 0)
+                    int protectedDirection = o.OrderAction == OrderAction.Buy ? -1 : 1;
+                    if (signed == 0 || Math.Sign(signed) != protectedDirection)
                     {
-                        double fill = 0, tickSize = 0.01, pointValue = 1;
-                        try { fill = e.Execution.Order.AverageFillPrice; } catch { }
-                        try
-                        {
-                            tickSize = instr.MasterInstrument.TickSize;
-                            pointValue = instr.MasterInstrument.PointValue;
-                        }
-                        catch { }
-                        if (fill > 0 && pointValue > 0 && tickSize > 0)
-                        {
-                            int dir = entryAction == OrderAction.Buy ? 1 : -1;
-                            if (tpAmount > 0)
-                                tpPrice = instr.MasterInstrument.RoundToTickSize(
-                                    fill + dir * (tpAmount / (tickSize * pointValue * filledQty)) * tickSize);
-                            if (slAmount > 0)
-                                slPrice = instr.MasterInstrument.RoundToTickSize(
-                                    fill - dir * (slAmount / (tickSize * pointValue * filledQty)) * tickSize);
-                            NinjaTrader.Code.Output.Process(string.Format(
-                                "TvBridge 金额括号: fill={0} tpAmount={1}->{2} slAmount={3}->{4}",
-                                fill, tpAmount, tpPrice, slAmount, slPrice), PrintTo.OutputTab1);
-                        }
+                        if (o.OrderState != OrderState.CancelPending && o.OrderState != OrderState.CancelSubmitted)
+                            acc.Cancel(new[] { o });
                     }
-
-                    string oco = "tv" + DateTime.Now.ToString("HHmmssfff");
-                    var bracket = new List<Order>();
-
-                    if (tpPrice > 0)
-                    {
-                        Order tpOrder = acc.CreateOrder(instr, exit, OrderType.Limit, OrderEntry.Manual,
-                            tif, filledQty, tpPrice, 0, oco, "TV TP", Core.Globals.MaxDate, null);
-                        if (tpOrder != null) bracket.Add(tpOrder);
-                    }
-                    if (slPrice > 0)
-                    {
-                        Order slOrder = acc.CreateOrder(instr, exit, OrderType.StopMarket, OrderEntry.Manual,
-                            tif, filledQty, 0, slPrice, oco, "TV SL", Core.Globals.MaxDate, null);
-                        if (slOrder != null) bracket.Add(slOrder);
-                    }
-                    if (bracket.Count > 0) acc.Submit(bracket.ToArray());
+                    else matching.Add(o);
                 }
-                catch (Exception ex)
+                var groups = matching.GroupBy(o => o.Oco).OrderBy(g => g.Key, StringComparer.Ordinal).ToArray();
+                if (groups.Length == 0) continue;
+                // Each OCO pair covers its allocated slice. TP and SL are alternatives, not additive.
+                var weights = groups.Select(g => g.Max(o => Math.Max(0, o.Quantity - o.Filled))).ToArray();
+                int total = weights.Sum();
+                if (total <= 0) continue;
+                int target = Math.Abs(signed);
+                var exact = weights.Select(w => (double)w * target / total).ToArray();
+                var allocations = exact.Select(x => (int)Math.Floor(x)).ToArray();
+                int extra = target - allocations.Sum();
+                foreach (int i in Enumerable.Range(0, groups.Length).OrderByDescending(i => exact[i] - allocations[i]).Take(extra))
+                    allocations[i]++;
+                for (int i = 0; i < groups.Length; i++)
                 {
-                    NinjaTrader.Code.Output.Process("TvBridgeAddOn 挂括号单失败: " + ex.Message, PrintTo.OutputTab1);
+                    var changes = new List<Order>();
+                    foreach (var o in groups[i])
+                    {
+                        if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted && o.OrderState != OrderState.PartFilled) continue;
+                        if (allocations[i] == 0) { acc.Cancel(new[] { o }); continue; }
+                        int desired = o.Filled + allocations[i]; // QuantityChanged is TOTAL, including filled contracts.
+                        if (o.Quantity == desired) continue;
+                        o.QuantityChanged = desired;
+                        o.LimitPriceChanged = o.LimitPrice;
+                        o.StopPriceChanged = o.StopPrice;
+                        changes.Add(o);
+                    }
+                    if (changes.Count > 0) acc.Change(changes.ToArray());
                 }
-            };
-            acc.ExecutionUpdate += handler;
+            }
         }
+
 
         // POST {account, orderId}
         private void HandleCancelOrder(NetworkStream ns, string body)
