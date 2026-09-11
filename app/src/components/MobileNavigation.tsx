@@ -4,10 +4,11 @@ import { Button } from '@/components/ui/button';
 import BridgeConnectionStatus, { type BridgeStatuses } from '@/components/BridgeConnectionStatus';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 
-type Page = 'chart' | 'overview' | 'records' | 'replay';
+type Page = 'chart' | 'overview' | 'records' | 'replay' | 'copy';
 const pages: { id: Page; label: string }[] = [
   { id: 'chart', label: '交易图表' }, { id: 'overview', label: '账户总览' },
   { id: 'records', label: '交易记录' }, { id: 'replay', label: '回放模拟' },
+  { id: 'copy', label: '复制交易' },
 ];
 const menuItem = 'min-h-8 text-xs focus:bg-[var(--tv-border)] focus:text-[var(--tv-text)]';
 

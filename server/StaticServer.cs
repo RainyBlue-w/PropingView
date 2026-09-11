@@ -18,6 +18,7 @@ namespace Nt8Terminal
         // 桥接始终留在本机；浏览器仅连接前端服务器，无需开放 8090 端口。
         private const string BridgeOrigin = "http://127.0.0.1:8090";
         private const string AtasBridgeOrigin = "http://127.0.0.1:8091";
+        private const string CopyServiceOrigin = "http://127.0.0.1:8092";
         private const int BridgeTimeoutMs = 30000;
         private const int MaxBodyBytes = 16 * 1024 * 1024;
 
@@ -93,6 +94,8 @@ namespace Nt8Terminal
             Console.WriteLine("站点目录: " + root);
             Console.WriteLine("监听地址: " + address + ":" + port + "；/api/* 转发至 " + BridgeOrigin);
             Console.WriteLine("ATAS X: /atas/api/* 转发至 " + AtasBridgeOrigin + "/api/*");
+            Console.WriteLine("复制交易: /copy/api/* 转发至 " + CopyServiceOrigin + "/api/*");
+            TryStartCopyService(exeDir);
             Console.WriteLine("关闭本窗口(或在任务管理器结束 NT8Terminal.exe)即停止服务。");
             if (openBrowser)
                 try { System.Diagnostics.Process.Start(browserUrl); } catch { }
@@ -110,6 +113,33 @@ namespace Nt8Terminal
             try { Console.ReadKey(true); } catch { }
         }
 
+        private static void TryStartCopyService(string exeDir)
+        {
+            string executable = Path.Combine(exeDir, "copy-trading", "CopyTrading.exe");
+            if (!File.Exists(executable)) executable = Path.Combine(exeDir, "copy-trading", "dist", "CopyTrading.exe");
+            if (!File.Exists(executable)) return;
+            try
+            {
+                // A running service belongs to its existing owner. Never replace or stop it.
+                int port = new Uri(CopyServiceOrigin).Port;
+                foreach (var endpoint in System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners())
+                    if (endpoint.Port == port) return;
+                using (System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = executable,
+                    WorkingDirectory = Path.GetDirectoryName(executable),
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
+                })) { }
+                Console.WriteLine("已启动复制交易后台服务；首次运行默认停用，需在网页配置并启用。");
+            }
+            catch (Exception error)
+            {
+                Console.WriteLine("复制交易服务未能启动: " + error.Message);
+            }
+        }
+
         private static void Handle(TcpClient client, string root)
         {
             using (client)
@@ -124,14 +154,21 @@ namespace Nt8Terminal
 
                 string rawPath = request.Target.Split('?')[0];
                 bool atas = rawPath == "/atas/api" || rawPath.StartsWith("/atas/api/", StringComparison.Ordinal);
-                if (atas || rawPath == "/api" || rawPath.StartsWith("/api/", StringComparison.Ordinal))
+                bool copy = rawPath == "/copy/api" || rawPath.StartsWith("/copy/api/", StringComparison.Ordinal);
+                if (copy && !AllowsCopyRequest(request))
+                {
+                    WriteJsonError(ns, 403, "Forbidden", "Copy trading requests must originate from the same site");
+                    return;
+                }
+                if (copy || atas || rawPath == "/api" || rawPath.StartsWith("/api/", StringComparison.Ordinal))
                 {
                     if (request.Method != "GET" && request.Method != "POST")
                     {
                         WriteJsonError(ns, 405, "Method Not Allowed", "Only GET and POST are supported");
                         return;
                     }
-                    ProxyApi(client, ns, request, atas);
+                    ProxyApi(client, ns, request, copy ? CopyServiceOrigin : atas ? AtasBridgeOrigin : BridgeOrigin,
+                        copy || atas ? request.Target.Substring(5) : request.Target, copy ? "Copy trading" : atas ? "ATAS X" : "NT8");
                     return;
                 }
                 if (request.Method != "GET") { WriteSimple(ns, 405, "Method Not Allowed"); return; }
@@ -173,6 +210,24 @@ namespace Nt8Terminal
                     "Connection: close\r\n\r\n");
                 try { ns.Write(head, 0, head.Length); ns.Write(data, 0, data.Length); } catch { }
             }
+        }
+
+        private static bool AllowsCopyRequest(Request request)
+        {
+            string site;
+            if (request.Headers.TryGetValue("Sec-Fetch-Site", out site) && site.Equals("cross-site", StringComparison.OrdinalIgnoreCase)) return false;
+            string origin;
+            if (!request.Headers.TryGetValue("Origin", out origin)) return true;
+            string host;
+            Uri source, destination;
+            if (!request.Headers.TryGetValue("Host", out host)
+                || !Uri.TryCreate(origin, UriKind.Absolute, out source)
+                || (source.Scheme != Uri.UriSchemeHttp && source.Scheme != Uri.UriSchemeHttps)
+                || source.UserInfo.Length != 0 || source.AbsolutePath != "/" || source.Query.Length != 0 || source.Fragment.Length != 0
+                || !Uri.TryCreate(source.Scheme + "://" + host, UriKind.Absolute, out destination)
+                || destination.UserInfo.Length != 0 || destination.AbsolutePath != "/" || destination.Query.Length != 0 || destination.Fragment.Length != 0)
+                return false;
+            return source.IdnHost.Equals(destination.IdnHost, StringComparison.OrdinalIgnoreCase) && source.Port == destination.Port;
         }
 
         // 读取完整请求头和 body，保留一次 Read 中已经读到的 body 字节。
@@ -235,13 +290,13 @@ namespace Nt8Terminal
             }
         }
 
-        private static void ProxyApi(TcpClient client, NetworkStream downstream, Request request, bool atas)
+        private static void ProxyApi(TcpClient client, NetworkStream downstream, Request request, string origin, string target, string provider)
         {
             HttpWebRequest upstream = null;
             bool responseStarted = false;
             try
             {
-                upstream = (HttpWebRequest)WebRequest.Create((atas ? AtasBridgeOrigin : BridgeOrigin) + (atas ? request.Target.Substring(5) : request.Target));
+                upstream = (HttpWebRequest)WebRequest.Create(origin + target);
                 upstream.Proxy = null;
                 upstream.Method = request.Method;
                 upstream.AllowAutoRedirect = false;
@@ -312,12 +367,12 @@ namespace Nt8Terminal
                 if (!responseStarted)
                 {
                     bool timeout = error.Status == WebExceptionStatus.Timeout;
-                    WriteJsonError(downstream, timeout ? 504 : 502, timeout ? "Gateway Timeout" : "Bad Gateway", (atas ? "ATAS X" : "NT8") + (timeout ? " bridge request timed out" : " bridge is unavailable"));
+                    WriteJsonError(downstream, timeout ? 504 : 502, timeout ? "Gateway Timeout" : "Bad Gateway", provider + (timeout ? " service request timed out" : " service is unavailable"));
                 }
             }
             catch
             {
-                if (!responseStarted) WriteJsonError(downstream, 502, "Bad Gateway", (atas ? "ATAS X" : "NT8") + " bridge proxy failed");
+                if (!responseStarted) WriteJsonError(downstream, 502, "Bad Gateway", provider + " service proxy failed");
             }
             finally { if (upstream != null) upstream.Abort(); }
         }

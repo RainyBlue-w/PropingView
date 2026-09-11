@@ -22,6 +22,8 @@ export interface Nt8Account {
 
 export interface Nt8Position {
   instrument: string;
+  /** 图表别名仅由桥端的原生合约关联提供；交易仍使用 instrument。 */
+  chartSymbols?: string[];
   /** 带符号:多为正,空为负 */
   quantity: number;
   averagePrice: number;
@@ -31,6 +33,7 @@ export interface Nt8Position {
 export interface Nt8Order {
   orderId: string;
   instrument: string;
+  chartSymbols?: string[];
   action: 'Buy' | 'Sell' | string;
   orderType: 'Market' | 'Limit' | 'StopMarket' | 'StopLimit' | string;
   quantity: number;

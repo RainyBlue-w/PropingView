@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { trading } from '@/lib/tradingRouter';
 import { type Nt8Bracket, type Nt8Order, type Nt8Position } from '@/lib/nt8Trading';
 import { onBeforeLayoutLoad } from '@/lib/tvLayoutEvents';
+import { matchesChartInstrument } from '@/lib/chartInstrument';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -138,6 +139,11 @@ export function useOrderLines({
   symbolRef.current = symbol;
   const getLastPriceRef = useRef(getLastPrice);
   getLastPriceRef.current = getLastPrice;
+  const drawingScopeRef = useRef({ widget, symbol, account });
+  const isDrawingScopeCurrent = () => {
+    const scope = drawingScopeRef.current;
+    return scope.widget === widgetRef.current && scope.symbol === symbolRef.current && scope.account === ctxRef.current.account;
+  };
 
   /** 主题感知的线文字色(浅色图表用深色字,反之亦然) */
   const lineTextColor = () => (ctxRef.current.theme === 'light' ? '#131722' : '#d1d4dc');
@@ -173,7 +179,7 @@ export function useOrderLines({
     let label = `${typeShort} | ${isBuy ? '+' : '-'}${remaining}`;
     if (isTp || isSl) {
       // 成交后挂出的止盈/止损腿:按持仓均价标注盈亏金额
-      const pos = positionsRef.current.find((p) => p.instrument === symbolRef.current);
+      const pos = positionsRef.current.find((p) => matchesChartInstrument(p, symbolRef.current));
       if (pos && pos.averagePrice > 0 && pv > 0) {
         const dir = pos.quantity > 0 ? 1 : -1;
         const v = Math.round((price - pos.averagePrice) * dir * pv * remaining * 100) / 100;
@@ -201,27 +207,37 @@ export function useOrderLines({
     return label;
   };
 
+  const discardLines = useCallback(() => {
+    drawingGenerationRef.current += 1;
+    creatingRef.current = new Set();
+    for (const pending of pendingMoveRef.current.values()) clearTimeout(pending.timer);
+    pendingMoveRef.current.clear();
+    settleRef.current.clear();
+    pendingCancelRef.current.clear();
+    progWriteRef.current.clear();
+    const entries = Array.from(linesRef.current.values());
+    linesRef.current.clear();
+    let chart: any = null;
+    try { chart = widget?.activeChart(); } catch { /* 图表已销毁 */ }
+    for (const entry of entries) {
+      intentionalRemoveRef.current.add(String(entry.id));
+      try { chart?.removeEntity(entry.id); } catch { /* 旧布局已经移除绘图 */ }
+    }
+  }, [widget]);
+
+  // The library retains drawings under their original chart symbol, even when
+  // getShapeById still returns them. Recreate managed lines for the new scope.
+  useEffect(() => {
+    // Layout loading already cleared the lines. Preserve its pending dataReady
+    // generation so a scope change during loading cannot prevent resume.
+    if (!loadingLayoutRef.current) discardLines();
+    drawingScopeRef.current = { widget, symbol, account };
+  }, [discardLines, widget, symbol, account]);
+
   // 加载布局会自动删除旧绘图，不能将这些事件当作手动撤单或改单。
   useEffect(() => {
     if (!widget) return;
     loadingLayoutRef.current = false;
-    const discardLines = () => {
-      drawingGenerationRef.current += 1;
-      creatingRef.current = new Set();
-      for (const pending of pendingMoveRef.current.values()) clearTimeout(pending.timer);
-      pendingMoveRef.current.clear();
-      settleRef.current.clear();
-      pendingCancelRef.current.clear();
-      progWriteRef.current.clear();
-      const entries = Array.from(linesRef.current.values());
-      linesRef.current.clear();
-      let chart: any = null;
-      try { chart = widget.activeChart(); } catch { /* 图表已销毁 */ }
-      for (const entry of entries) {
-        intentionalRemoveRef.current.add(String(entry.id));
-        try { chart?.removeEntity(entry.id); } catch { /* 旧布局已经移除绘图 */ }
-      }
-    };
     const onLoadRequested = () => {
       loadingLayoutRef.current = true;
       discardLines();
@@ -252,7 +268,7 @@ export function useOrderLines({
       try { widget.unsubscribe?.('chart_load_requested', onLoadRequested); } catch { /* ignore */ }
       try { widget.unsubscribe?.('chart_loaded', onLoaded); } catch { /* ignore */ }
     };
-  }, [widget]);
+  }, [widget, discardLines]);
 
   // ---- drawing_event 订阅(每个 widget 一次):拖拽改价 + 删线撤单 ----
   useEffect(() => {
@@ -272,6 +288,7 @@ export function useOrderLines({
         if (type === 'remove') intentionalRemoveRef.current.delete(entityId);
         return;
       }
+      if (widget !== widgetRef.current || !isDrawingScopeCurrent()) return;
 
       if (type === 'remove') {
         if (intentionalRemoveRef.current.delete(entityId)) return; // 我们自己删的
@@ -370,7 +387,7 @@ export function useOrderLines({
      * 结算后把线吸附到改单价,使"线停在哪 / 改到什么价 / 轴上显示什么价"一致。
      */
     const flushMove = (orderId: string) => {
-      if (loadingLayoutRef.current) return;
+      if (loadingLayoutRef.current || widget !== widgetRef.current || !isDrawingScopeCurrent()) return;
       const pend = pendingMoveRef.current.get(orderId);
       if (!pend) return;
       pendingMoveRef.current.delete(orderId);
@@ -471,7 +488,7 @@ export function useOrderLines({
       if (loadingLayoutRef.current) return;
       const entry = linesRef.current.get('__position__');
       if (!entry) return;
-      const pos = positionsRef.current.find((p) => p.instrument === symbolRef.current);
+      const pos = positionsRef.current.find((p) => matchesChartInstrument(p, symbolRef.current));
       if (!pos) return;
       const label = posLabel(pos);
       if (entry.lastText === label) return;
@@ -496,7 +513,8 @@ export function useOrderLines({
     const creating = creatingRef.current;
     const generation = drawingGenerationRef.current;
     const discardStaleShape = (id: any): boolean => {
-      if (generation === drawingGenerationRef.current && widgetRef.current === widget && !loadingLayoutRef.current) return false;
+      if (generation === drawingGenerationRef.current && widgetRef.current === widget &&
+          symbolRef.current === symbol && ctxRef.current.account === account && !loadingLayoutRef.current) return false;
       intentionalRemoveRef.current.add(String(id));
       try { chart.removeEntity(id); } catch { /* 旧布局已经移除绘图 */ }
       return true;
@@ -516,9 +534,9 @@ export function useOrderLines({
     };
 
     const working = orders.filter(
-      (o) => o.instrument === symbol && WORKING_STATES.has(o.state),
+      (o) => matchesChartInstrument(o, symbol) && WORKING_STATES.has(o.state),
     );
-    const pos = positions.find((p) => p.instrument === symbol);
+    const pos = positions.find((p) => matchesChartInstrument(p, symbol));
 
     // 撤单确认:订单从轮询列表消失后解禁;超时兜底防永久冻结
     for (const [oid, ts] of Array.from(pendingCancelRef.current)) {

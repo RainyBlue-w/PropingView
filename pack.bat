@@ -11,7 +11,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [1/3] Building frontend...
+echo [1/4] Building frontend...
 cd app
 call npm run build
 if errorlevel 1 (
@@ -29,7 +29,7 @@ if not exist "%CSC%" (
     exit /b 1
 )
 
-echo [2/3] Compiling NT8Terminal.exe...
+echo [2/4] Compiling NT8Terminal.exe...
 "%CSC%" /target:exe /platform:anycpu /out:"%~dp0NT8Terminal.exe" "%~dp0server\StaticServer.cs" >nul
 if errorlevel 1 (
     echo [X] exe compile failed
@@ -37,8 +37,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [3/3] Creating zip...
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "Compress-Archive -Path 'NT8Terminal.exe','nt8-bridge\TvBridgeAddOn.cs','app\dist','README.txt' -DestinationPath 'NT8Terminal-package.zip' -Force -CompressionLevel Optimal"
+echo [3/4] Building copy trading service...
+call "%~dp0copy-trading\build.cmd"
+if errorlevel 1 (
+    echo [X] Copy trading build failed - .NET 10 SDK is required
+    pause
+    exit /b 1
+)
+
+echo [4/4] Creating zip...
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0server\package.ps1"
 if errorlevel 1 (
     echo [X] Zip failed
     pause

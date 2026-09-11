@@ -222,7 +222,7 @@ internal sealed class AtasTradingService : IDisposable
         var (connector, portfolio) = ResolveAccount(account);
         return new { positions = connector.Positions.Where(p => p.AccountID == portfolio.AccountID && p.Volume != 0).Select(p => new
         {
-            instrument = Symbol(p.Security), quantity = p.Volume, averagePrice = p.AveragePrice,
+            instrument = Symbol(p.Security), chartSymbols = ChartSymbols(connector, p.Security), quantity = p.Volume, averagePrice = p.AveragePrice,
             marketPosition = p.Volume > 0 ? "Long" : "Short",
         }).ToArray() };
     }
@@ -233,6 +233,7 @@ internal sealed class AtasTradingService : IDisposable
         return new { orders = AccountOrders(connector, portfolio).Where(IsWorking).Select(o => new
         {
             orderId = OrderKey(o), instrument = o.Security is null ? o.SecurityId ?? "" : Symbol(o.Security),
+            chartSymbols = o.Security is null ? new[] { o.SecurityId ?? "" } : ChartSymbols(connector, o.Security),
             action = o.Direction == OrderDirections.Buy ? "Buy" : "Sell",
             orderType = o.Type switch { OrderTypes.Stop => "StopMarket", OrderTypes.StopLimit => "StopLimit", _ => o.Type.ToString() },
             quantity = o.QuantityToFill, filled = Filled(o), limitPrice = o.Price, stopPrice = o.TriggerPrice,
@@ -550,6 +551,12 @@ internal sealed class AtasTradingService : IDisposable
     private static decimal Filled(Order order) => order.State == OrderStates.None ? 0 : Math.Max(0, order.QuantityToFill - order.Unfilled);
     private bool SameSecurity(Security a, Security b) => ReferenceEquals(a, b) || Symbol(a) == Symbol(b);
     private string Symbol(Security security) => _access.SymbolName(security);
+    private string[] ChartSymbols(IDataFeedConnector connector, Security security)
+    {
+        var canonical = Symbol(security);
+        try { return new[] { canonical }.Concat(_access.ChartSymbols(connector, security)).Where(s => !string.IsNullOrWhiteSpace(s)).Distinct(StringComparer.Ordinal).ToArray(); }
+        catch { return [canonical]; }
+    }
     private string AccountKey(IDataFeedConnector connector, string account) => _access.ConnectionId(connector).ToString("N") + ":" + account;
     private string ConnectorName(IDataFeedConnector connector) => _access.ConnectionName(connector);
 

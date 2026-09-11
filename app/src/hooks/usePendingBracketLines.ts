@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import type { Nt8Bracket, Nt8Order } from '@/lib/nt8Trading';
+import { matchesChartInstrument } from '@/lib/chartInstrument';
 
 interface Params {
   widget: TradingViewWidget | null;
@@ -35,7 +36,7 @@ export function usePendingBracketLines({ widget, symbol, account, epoch, orders,
   useEffect(() => {
     const wanted = new Map<string, { price: number; text: string; color: string }>();
     for (const bracket of brackets) {
-      const o = orders.find(o => o.orderId === bracket.entryOrderId && o.instrument === symbol);
+      const o = orders.find(o => o.orderId === bracket.entryOrderId && matchesChartInstrument(o, symbol));
       if (!o || !['Limit', 'StopMarket', 'StopLimit'].includes(o.orderType)
         || ['Filled', 'Cancelled', 'Rejected', 'CancelPending', 'CancelSubmitted'].includes(o.state)) continue;
       const qty = o.quantity - o.filled;

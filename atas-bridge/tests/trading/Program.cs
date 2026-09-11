@@ -3,6 +3,7 @@ using TvAtasBridge;
 using System.Reflection;
 using System.Runtime.Loader;
 using ATAS.DataFeedsCore;
+using Utils.Common.Collections.Synchronized;
 
 // Load entity dependencies only. The connector used below is always a DispatchProxy fake;
 // no platform services, account connections or ATAS host are constructed.
@@ -23,6 +24,7 @@ static void Check(bool condition, string name)
 await ServiceTests.Run(Check);
 await FailureTests.Run(Check);
 await LifecycleTests.Run(Check);
+ChartSymbolTests.Run(Check);
 
 Check(ProtectionMath.DesiredQuantity(5, 1) == 5, "scale in increases protection to net position");
 Check(ProtectionMath.DesiredQuantity(2, 1) == 2, "scale out reduces protection to net position");
@@ -130,5 +132,39 @@ internal static class LifecycleTests
         public string ConnectionName(IDataFeedConnector _) => "Lifecycle test";
         public Security ResolveSecurity(string symbol, IDataFeedConnector source) => source.Securities.Single(security => security.SecurityId == symbol);
         public string SymbolName(Security security) => security.SecurityId;
+        public string[] ChartSymbols(IDataFeedConnector _, Security security) => [security.SecurityId];
+    }
+}
+
+internal static class ChartSymbolTests
+{
+    public static void Run(Action<bool, string> check)
+    {
+        var connector = DispatchProxy.Create<IDataFeedConnector, FakeConnector>();
+        var otherConnector = DispatchProxy.Create<IDataFeedConnector, FakeConnector>();
+        var security = new Security { SecurityId = "MNQU6@CME" };
+        var differentSecurity = new Security { SecurityId = security.SecurityId };
+        SyncDictionary<IDataFeedConnector, Security> Mapping(IDataFeedConnector source, Security value)
+        {
+            var map = new SyncDictionary<IDataFeedConnector, Security>();
+            map[source] = value;
+            return map;
+        }
+        var instruments = new (string Symbol, SyncDictionary<IDataFeedConnector, Security> Securities)[]
+        {
+            ("MNQU6@CME#atas-id=first", Mapping(connector, security)),
+            ("MNQU6@CME#atas-id=delayed", Mapping(connector, security)),
+            ("MNQU6@CME#atas-id=first", Mapping(connector, security)),
+            ("MNQU6@CME#atas-id=different-security", Mapping(connector, differentSecurity)),
+            ("MNQU6@CME#atas-id=different-connector", Mapping(otherConnector, security)),
+        };
+        var index = AtasPlatformAccess.BuildChartSymbolIndex(connector, instruments);
+        check(index[security].ToHashSet().SetEquals(["MNQU6@CME#atas-id=first", "MNQU6@CME#atas-id=delayed"]),
+            "same native security across two chart instruments yields both aliases without duplicates");
+        check(index.Count == 2 && index[differentSecurity].SequenceEqual(["MNQU6@CME#atas-id=different-security"]),
+            "same SecurityId on a different native security object is never merged");
+        var otherIndex = AtasPlatformAccess.BuildChartSymbolIndex(otherConnector, instruments);
+        check(otherIndex.Count == 1 && otherIndex[security].SequenceEqual(["MNQU6@CME#atas-id=different-connector"]),
+            "chart aliases are scoped to the exact connector mapping");
     }
 }

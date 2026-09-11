@@ -181,10 +181,12 @@ function ChartPane({ index, info, active, visible, multiple, onSelect, onRegiste
   useEffect(() => {
     if (widget && widget.getTheme?.().toLowerCase() !== theme) void widget.changeTheme?.(theme);
   }, [widget, theme]);
-  const instrument = symbols.find(s => s.symbol === current.symbol);
+  // chart.symbol() uppercases native ATAS IDs; metadata/prices retain their canonical spelling.
+  const instrument = symbols.find(s => s.symbol.toUpperCase() === current.symbol.toUpperCase());
+  const priceSymbol = instrument?.symbol || current.symbol;
   const tickSize = instrument?.tickSize || 0.25;
   const pointValue = resolvePointValue(current.symbol, instrument?.pointValue);
-  const getLastPrice = useCallback(() => datafeed.getLastPrice(current.symbol), [datafeed, current.symbol]);
+  const getLastPrice = useCallback(() => datafeed.getLastPrice(priceSymbol), [datafeed, priceSymbol]);
   const subscribePrice = useCallback((fn: (symbol: string, price: number) => void) => datafeed.onPriceChange(fn), [datafeed]);
   useOrderLines({ widget, symbol: current.symbol, account: tradingEnabled ? account : '', orders: tradingEnabled ? orders : [],
     positions: tradingEnabled ? positions : [], brackets: tradingEnabled ? brackets : [], tickSize, pointValue,

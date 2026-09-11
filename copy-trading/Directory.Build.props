@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)..\.build-check\copy-trading\obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
+    <BaseOutputPath>$(MSBuildThisFileDirectory)..\.build-check\copy-trading\bin\$(MSBuildProjectName)\</BaseOutputPath>
+  </PropertyGroup>
+</Project>

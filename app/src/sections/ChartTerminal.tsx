@@ -8,6 +8,7 @@ import MobileNavigation from '@/components/MobileNavigation';
 import BridgeConnectionStatus from '@/components/BridgeConnectionStatus';
 import TradingPanel, { type OrderKind } from '@/sections/TradingPanel';
 import AccountPages from '@/sections/AccountPages';
+import CopyTradingPage from '@/sections/CopyTradingPage';
 import ReplayBar from '@/sections/ReplayBar';
 import ReplayDashboard from '@/sections/ReplayDashboard';
 import { createReplaySession, deleteReplaySession, loadReplaySessions, saveReplaySession, type ReplaySession as SavedReplaySession, type NewReplaySessionInput } from '@/lib/replayStore';
@@ -72,7 +73,7 @@ export default function ChartTerminal() {
   const quoteSwitchGeneration = useRef(0);
   const initialAccountSource = useRef(false);
   const [bridgeStatuses, setBridgeStatuses] = useState<Partial<Record<BridgeProvider, Nt8Status | null>>>({});
-  const [page, setPage] = useState<'chart' | 'overview' | 'records' | 'replay'>('chart');
+  const [page, setPage] = useState<'chart' | 'overview' | 'records' | 'replay' | 'copy'>('chart');
   const compact = useMediaQuery('(max-width: 1023px)');
   // 手机在图表下方打开一个紧凑面板；不覆盖桌面双面板的打开状态与宽度偏好。
   const [mobilePanel, setMobilePanel] = useState<'trading' | 'account' | 'replay' | null>(null);
@@ -247,7 +248,7 @@ export default function ChartTerminal() {
   }, [refreshLiveAccounts]);
 
   // ---- 隐藏账户(账户页眼睛开关;localStorage 记忆) ----
-  // (位置需在 connect 之前:connect/refreshTrading 引用 pruneHiddenAccounts,块级声明不能前向引用)
+  // 账户快照可能因部分连接离线而暂缺；隐藏偏好只随用户的眼睛开关变更。
   const [hiddenAccounts, setHiddenAccounts] = useState<string[]>(() => {
     try {
       const raw = JSON.parse(localStorage.getItem(HIDDEN_ACCOUNTS_KEY) || '[]');
@@ -258,19 +259,6 @@ export default function ChartTerminal() {
     setHiddenAccounts((cur) => {
       const next = cur.includes(name) ? cur.filter((n) => n !== name) : [...cur, name];
       try { localStorage.setItem(HIDDEN_ACCOUNTS_KEY, JSON.stringify(next)); } catch { /* ignore */ }
-      return next;
-    });
-  }, []);
-
-  /** 隐藏列表跟随最新账户数据:已不存在于 NT8 的账户(如已关闭)从隐藏列表清掉 */
-  const pruneHiddenAccounts = useCallback((fresh: Nt8Account[]) => {
-    const names = new Set(fresh.map((a) => a.name));
-    const sources = new Set(fresh.map(account => account.provider));
-    setHiddenAccounts((cur) => {
-      const next = cur.filter((n) => !sources.has(parseBridgeAccount(n).provider) || names.has(n));
-      if (next.length !== cur.length) {
-        try { localStorage.setItem(HIDDEN_ACCOUNTS_KEY, JSON.stringify(next)); } catch { /* ignore */ }
-      }
       return next;
     });
   }, []);
@@ -339,7 +327,6 @@ export default function ChartTerminal() {
         if (generation !== connectionGeneration.current) return;
         setAccounts(accs);
         setLiveAccounts(accs);
-        pruneHiddenAccounts(accs);
         setAccount((cur) =>
           cur && accs.some((a) => a.name === cur) ? cur : accs[0]?.name ?? '',
         );
@@ -390,8 +377,6 @@ export default function ChartTerminal() {
       if (bracketsRes) setBrackets(bracketsRes.brackets);
       if (accsRes) {
         setAccounts(accsRes.accounts);
-        // 回放期间轮询返回的是模拟账户,不能拿它清理真实账户的隐藏偏好
-        if (!sessionRef.current) pruneHiddenAccounts(accsRes.accounts);
       }
       // 成交/持仓变化时推进签名,驱动图上交易历史箭头刷新(有变化才刷)
       const sig =
@@ -409,7 +394,7 @@ export default function ChartTerminal() {
     } finally {
       if (pollInFlight.current === context) pollInFlight.current = null;
     }
-  }, [accountConnected, account, pruneHiddenAccounts, pollContext]);
+  }, [accountConnected, account, pollContext]);
 
   useEffect(() => {
     if ((!accountConnected && !replayActive) || !account) return;
@@ -938,7 +923,7 @@ export default function ChartTerminal() {
       /> : <nav aria-label="主导航" className="flex shrink-0 flex-wrap items-center gap-1 border-b border-[var(--tv-border)] bg-[var(--tv-panel)] px-2 py-1 text-sm text-[var(--tv-text)] lg:h-12 lg:flex-nowrap lg:px-3 lg:py-0">
         <span className="mr-3 hidden 2xl:inline text-xs font-semibold tracking-widest">TRADING TERMINAL</span>
         <div className="flex w-full min-w-0 items-center gap-1 lg:w-auto">
-        {([{ id: 'chart', label: '交易图表' }, { id: 'overview', label: '账户总览' }, { id: 'records', label: '交易记录' }, { id: 'replay', label: '回放模拟' }] as const).map(item =>
+        {([{ id: 'chart', label: '交易图表' }, { id: 'overview', label: '账户总览' }, { id: 'records', label: '交易记录' }, { id: 'replay', label: '回放模拟' }, { id: 'copy', label: '复制交易' }] as const).map(item =>
           <button key={item.id} aria-current={page === item.id ? 'page' : undefined} onClick={() => void navigate(item.id)}
             className={`whitespace-nowrap rounded-md px-2 py-2 sm:px-4 ${page === item.id ? 'bg-[#2962ff]/15 text-[#5b8cff]' : 'text-[var(--tv-muted)] hover:text-[var(--tv-text)]'}`}>{item.label}</button>)}
         </div>
@@ -1255,6 +1240,7 @@ export default function ChartTerminal() {
         /></div>
       </div>
       </div>
+      {page === 'copy' && <div className="absolute inset-0"><CopyTradingPage /></div>}
       {(page === 'overview' || page === 'records') && <div className="absolute inset-0"><AccountPages
         page={page} accounts={liveAccounts} error={liveAccountsError} enabled={BRIDGE_PROVIDERS.some(source => bridgeStatuses[source]?.connected)} onRefresh={refreshLiveAccounts}
       /></div>}

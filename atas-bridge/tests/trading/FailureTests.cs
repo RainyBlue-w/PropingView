@@ -114,5 +114,6 @@ internal static class FailureTests
         public string ConnectionName(IDataFeedConnector _) => "Failure test";
         public Security ResolveSecurity(string symbol, IDataFeedConnector c) => c.Securities.Single(s => s.SecurityId == symbol);
         public string SymbolName(Security security) => security.SecurityId;
+        public string[] ChartSymbols(IDataFeedConnector _, Security security) => [security.SecurityId];
     }
 }

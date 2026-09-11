@@ -34,8 +34,19 @@ internal static class ServiceTests
             var positions = (await Call("/api/positions", account: account)).GetProperty("positions");
             check(positions.GetArrayLength() == 1 && positions[0].GetProperty("instrument").GetString() == es.SecurityId,
                 "all contracts included, other accounts excluded");
+            check(positions[0].GetProperty("chartSymbols").EnumerateArray().Select(s => s.GetString()).SequenceEqual(new[] { es.SecurityId, es.SecurityId + "#chart-alias" }),
+                "position response exposes chart aliases while retaining the native instrument");
+            platform.FailChartSymbols = true;
+            var fallbackPositions = (await Call("/api/positions", account: account)).GetProperty("positions");
+            check(fallbackPositions.GetArrayLength() == 1 && fallbackPositions[0].GetProperty("chartSymbols").GetArrayLength() == 1 &&
+                fallbackPositions[0].GetProperty("chartSymbols")[0].GetString() == es.SecurityId && fallbackPositions[0].GetProperty("averagePrice").GetDecimal() == 6000,
+                "display alias failure preserves native position and average price");
+            platform.FailChartSymbols = false;
             var entryResult = await Call("/api/order/place", new { account, symbol = nq.SecurityId, action = "BUY", orderType = "LIMIT", quantity = 4, limitPrice = 20000, tp = 20010, sl = 19990 });
             var entry = fake.Orders.Single();
+            var entrySnapshot = (await Call("/api/orders", account: account)).GetProperty("orders")[0];
+            check(entrySnapshot.GetProperty("instrument").GetString() == nq.SecurityId && entrySnapshot.GetProperty("chartSymbols").GetArrayLength() == 2 && ReferenceEquals(entry.Security, nq),
+                "order chart aliases never replace the native order security or instrument");
             check(fake.Calls.Count == 1, "pending entry creates no live protection orders");
             var pending = (await Call("/api/brackets", account: account)).GetProperty("brackets");
             check(pending.GetArrayLength() == 1 && pending[0].GetProperty("tp").GetDecimal() == 20010, "unfilled entry exposes dashed preview prices");
@@ -128,11 +139,14 @@ internal static class ServiceTests
 
     private sealed class FakePlatform(IDataFeedConnector connector) : IAtasTradingPlatform
     {
+        public bool FailChartSymbols;
         public IDataFeedConnector[] GetConnectors() => [connector];
         public Guid ConnectionId(IDataFeedConnector _) => new("01234567-89ab-cdef-0123-456789abcdef");
         public string ConnectionName(IDataFeedConnector _) => "Fake";
         public Security ResolveSecurity(string symbol, IDataFeedConnector c) => c.Securities.Single(s => s.SecurityId == symbol);
         public string SymbolName(Security security) => security.SecurityId;
+        public string[] ChartSymbols(IDataFeedConnector _, Security security) => FailChartSymbols
+            ? throw new InvalidOperationException("Synthetic display metadata failure") : [security.SecurityId, security.SecurityId + "#chart-alias"];
     }
 }
 

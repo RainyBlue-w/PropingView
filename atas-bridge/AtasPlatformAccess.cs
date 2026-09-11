@@ -7,6 +7,7 @@ using OFT.Platform.Core.Managers.Connections;
 using OFT.Platform.Core.Managers.Instruments;
 using OFT.Platform.Core.Providers;
 using OFT.Plarform.Core.Extensions;
+using Utils.Common.Collections.Synchronized;
 using PlatformInstrument = OFT.Platform.Models.Instrument;
 
 namespace TvAtasBridge;
@@ -22,6 +23,9 @@ public sealed class AtasPlatformAccess
     private sealed record Catalog(Contract[] Contracts, Dictionary<ContractIdentifier, string> Names, long Stamp);
     private readonly object _catalogGate = new();
     private Catalog? _catalog;
+    private sealed record ChartCatalog(Dictionary<Security, string[]> Symbols, long Stamp);
+    private readonly object _chartCatalogGate = new();
+    private readonly Dictionary<IDataFeedConnector, ChartCatalog> _chartCatalogs = new(ReferenceEqualityComparer.Instance);
     public static IReadOnlyList<string> SupportedVersions { get; } = Array.AsReadOnly(new[] { "8.0.14.646", "8.0.15.643" });
     public static string RuntimeVersion => FileVersionInfo.GetVersionInfo(typeof(MarketDataAdapter).Assembly.Location).FileVersion ?? "unknown";
     public IIndicatorDataProvider DataProvider { get; }
@@ -97,6 +101,53 @@ public sealed class AtasPlatformAccess
         var instrument = PlatformInstrument.GetInstrument(security);
         var contract = instrument?.ContractDescription ?? Instruments.TryGetContractBySecurityId(security.SecurityId);
         return contract == null ? security.SecurityId : SymbolName(contract);
+    }
+
+    /// <summary>Display aliases only: separate native contracts can reference the same connector security.</summary>
+    public string[] ChartSymbols(IDataFeedConnector connector, Security security)
+    {
+        var canonical = SymbolName(security);
+        try
+        {
+            lock (_chartCatalogGate)
+            {
+                if (!_chartCatalogs.TryGetValue(connector, out var catalog) || Environment.TickCount64 - catalog.Stamp >= 1000)
+                {
+                    // Capture the naming catalog once; account polling must not scan it for every position.
+                    var names = GetCatalog().Names;
+                    var instruments = Instruments.PlatformInstruments;
+                    catalog = new ChartCatalog(BuildChartSymbolIndex(connector, instruments.Select(instrument =>
+                        (names.GetValueOrDefault(instrument.ContractDescription.Identifier, BaseSymbolName(instrument.ContractDescription)),
+                         instrument.SecuritiesByConnector))), Environment.TickCount64);
+                    _chartCatalogs[connector] = catalog;
+                }
+                return catalog.Symbols.TryGetValue(security, out var aliases)
+                    ? new[] { canonical }.Concat(aliases).Distinct(StringComparer.Ordinal).ToArray()
+                    : [canonical];
+            }
+        }
+        catch
+        {
+            // Missing display metadata must never hide an otherwise valid native position/order.
+            lock (_chartCatalogGate)
+                _chartCatalogs[connector] = new ChartCatalog(new(ReferenceEqualityComparer.Instance), Environment.TickCount64);
+            return [canonical];
+        }
+    }
+
+    internal static Dictionary<Security, string[]> BuildChartSymbolIndex(IDataFeedConnector connector,
+        IEnumerable<(string Symbol, SyncDictionary<IDataFeedConnector, Security> Securities)> instruments)
+    {
+        var symbols = new Dictionary<Security, HashSet<string>>(ReferenceEqualityComparer.Instance);
+        foreach (var (symbol, securities) in instruments)
+        {
+            // The native SyncDictionary.TryGetValue takes its internal SyncRoot lock.
+            // Never join by SecurityId: equal text from a different security/connector is insufficient.
+            if (!securities.TryGetValue(connector, out var security) || security is null || string.IsNullOrWhiteSpace(symbol)) continue;
+            if (!symbols.TryGetValue(security, out var aliases)) symbols.Add(security, aliases = new(StringComparer.Ordinal));
+            aliases.Add(symbol);
+        }
+        return symbols.ToDictionary(pair => pair.Key, pair => pair.Value.ToArray(), (IEqualityComparer<Security>)ReferenceEqualityComparer.Instance);
     }
 
     public Contract ResolveContract(string symbol)

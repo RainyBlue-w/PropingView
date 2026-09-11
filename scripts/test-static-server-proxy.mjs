@@ -19,6 +19,15 @@ const listen = (server) => new Promise((resolve, reject) => {
   server.listen(0, '127.0.0.1', () => resolve(server.address().port));
 });
 const close = (server) => new Promise((resolve) => server.close(resolve));
+const requestWithHost = (url, headers, method = 'GET') => new Promise((resolve, reject) => {
+  const request = http.request(url, { method, headers }, response => {
+    const chunks = [];
+    response.on('data', chunk => chunks.push(chunk));
+    response.on('end', () => resolve({ status: response.statusCode, data: JSON.parse(Buffer.concat(chunks).toString('utf8')) }));
+  });
+  request.on('error', reject);
+  request.end();
+});
 const sockets = new Set();
 let openEvents = 0;
 let receivedPosts = 0;
@@ -47,7 +56,7 @@ const bridge = http.createServer(async (req, res) => {
   const body = Buffer.concat(chunks).toString('utf8');
   if (req.method === 'POST') receivedPosts++;
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-  res.end(JSON.stringify({ provider: res.getHeader('X-Mock-Provider') ?? 'nt8', method: req.method, url: req.url, body, contentType: req.headers['content-type'], lastEventId: req.headers['last-event-id'] }));
+  res.end(JSON.stringify({ provider: res.getHeader('X-Mock-Provider') ?? 'nt8', method: req.method, url: req.url, body, contentType: req.headers['content-type'], lastEventId: req.headers['last-event-id'], origin: req.headers.origin, fetchSite: req.headers['sec-fetch-site'] }));
 });
 bridge.on('connection', (socket) => {
   sockets.add(socket);
@@ -61,22 +70,34 @@ atasBridge.on('connection', (socket) => {
   sockets.add(socket);
   socket.once('close', () => sockets.delete(socket));
 });
+const copyService = http.createServer((req, res) => {
+  res.setHeader('X-Mock-Provider', 'copy');
+  bridge.emit('request', req, res);
+});
+copyService.on('connection', (socket) => {
+  sockets.add(socket);
+  socket.once('close', () => sockets.delete(socket));
+});
 let process;
 const eventRequests = [];
 try {
   const bridgePort = await listen(bridge);
   const atasPort = await listen(atasBridge);
+  const copyPort = await listen(copyService);
   assert.notEqual(bridgePort, 8090);
   assert.notEqual(atasPort, 8091);
+  assert.notEqual(copyPort, 8092);
   const reservation = net.createServer();
   const port = await listen(reservation);
   await close(reservation);
   const source = (await readFile(path.join(root, 'server/StaticServer.cs'), 'utf8'))
     .replace('private const string BridgeOrigin = "http://127.0.0.1:8090";', `private const string BridgeOrigin = "http://127.0.0.1:${bridgePort}";`)
     .replace('private const string AtasBridgeOrigin = "http://127.0.0.1:8091";', `private const string AtasBridgeOrigin = "http://127.0.0.1:${atasPort}";`)
+    .replace('private const string CopyServiceOrigin = "http://127.0.0.1:8092";', `private const string CopyServiceOrigin = "http://127.0.0.1:${copyPort}";`)
     .replace('private const int BridgeTimeoutMs = 30000;', 'private const int BridgeTimeoutMs = 800;');
   assert(!source.includes('private const string BridgeOrigin = "http://127.0.0.1:8090";'));
   assert(!source.includes('private const string AtasBridgeOrigin = "http://127.0.0.1:8091";'));
+  assert(!source.includes('private const string CopyServiceOrigin = "http://127.0.0.1:8092";'));
   const sourceFile = path.join(work, 'StaticServer.cs');
   const executable = path.join(work, 'TestStaticServer.exe');
   await writeFile(sourceFile, source);
@@ -141,12 +162,37 @@ try {
   assert.equal(atasOrder.body, payload, 'ATAS receives original UTF-8 body');
   assert.equal((await fetch(origin + query).then(r => r.json())).provider, 'nt8', 'NT8 keeps its independent upstream');
   assert.equal((await fetch(origin + '/atas/api/error')).status, 409);
+  const copyStatus = await fetch(origin + '/copy' + query).then(r => r.json());
+  assert.equal(copyStatus.provider, 'copy');
+  assert.equal(copyStatus.url, query, 'strip only copy service prefix and retain encoded query');
+  const copyRule = await fetch(origin + '/copy/api/mock-rule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload }).then(r => r.json());
+  assert.equal(copyRule.provider, 'copy');
+  assert.equal(copyRule.body, payload, 'copy service receives original UTF-8 body');
+  assert.equal((await fetch(origin + '/copy/api/error')).status, 409);
+  const postsBeforeRejections = receivedPosts;
+  for (const headers of [
+    { Origin: 'https://foreign.example' },
+    { Origin: 'null' },
+    { Origin: `http://127.0.0.1:${port + 1}` },
+    { 'Sec-Fetch-Site': 'cross-site' },
+  ]) {
+    assert.equal((await fetch(origin + '/copy/api/stop-all', { method: 'POST', headers, body: 'form' })).status, 403);
+  }
+  assert.equal(receivedPosts, postsBeforeRejections, 'rejected cross-site requests must never reach the copy service');
+  const sameOrigin = await fetch(origin + '/copy/api/mock-rule', { method: 'POST', headers: { Origin: origin, 'Sec-Fetch-Site': 'same-origin' } }).then(r => r.json());
+  assert.equal(sameOrigin.provider, 'copy');
+  assert.equal(sameOrigin.origin, undefined);
+  assert.equal(sameOrigin.fetchSite, undefined);
+  const remoteOrigin = await requestWithHost(origin + '/copy/api/mock-rule', { Host: 'terminal.example.test:7443', Origin: 'https://terminal.example.test:7443' }, 'POST');
+  assert.equal(remoteOrigin.data.provider, 'copy', 'public remote host and origin are compared before forwarding to loopback');
+  const standardHttps = await requestWithHost(origin + '/copy/api/status', { Host: 'terminal.example.test', Origin: 'https://terminal.example.test:443' });
+  assert.equal(standardHttps.status, 200, 'normalise default HTTPS ports');
 
   const failure = await fetch(origin + '/api/error');
   assert.equal(failure.status, 409);
   assert.equal(failure.headers.get('retry-after'), '2');
   assert.deepEqual(await failure.json(), { ok: false, error: '订单已变更' });
-  for (const apiPath of ['/api', '/api/missing', '/atas/api', '/atas/api/missing']) {
+  for (const apiPath of ['/api', '/api/missing', '/atas/api', '/atas/api/missing', '/copy/api', '/copy/api/missing']) {
     const missing = await fetch(origin + apiPath);
     assert.equal(missing.status, 404);
     assert.deepEqual(await missing.json(), { error: 'API not found' });
@@ -206,14 +252,20 @@ try {
   assert.match(offline.headers.get('content-type'), /application\/json/);
   assert.equal((await offline.json()).ok, false);
   assert.equal((await fetch(origin + '/atas/api/status')).status, 200, 'NT8 offline does not disconnect ATAS');
+  assert.equal((await fetch(origin + '/copy/api/status')).status, 200, 'NT8 offline does not disconnect copy service');
   await close(atasBridge);
   assert([502, 504].includes((await fetch(origin + '/atas/api/status')).status));
-  console.log('PASS static proxy: dual-provider routing/isolation, GET/query, UTF-8 POST, segmented body, HTTP errors, API no-SPA, method/path guards, concurrent SSE, disconnect cleanup, timeout/offline JSON, complete static assets');
+  await close(copyService);
+  const copyOffline = await fetch(origin + '/copy/api/status');
+  assert([502, 504].includes(copyOffline.status));
+  assert.match((await copyOffline.json()).error, /Copy trading/);
+  console.log('PASS static proxy: independent NT8/ATAS/copy routing, GET/query, UTF-8 POST, segmented body, HTTP errors, API no-SPA, method/path guards, concurrent SSE, disconnect cleanup, timeout/offline JSON, complete static assets');
 } finally {
   for (const request of eventRequests) request.destroy();
   for (const socket of sockets) socket.destroy();
   if (bridge.listening) await close(bridge);
   if (atasBridge.listening) await close(atasBridge);
+  if (copyService.listening) await close(copyService);
   if (process && process.exitCode === null) {
     process.kill();
     await new Promise((resolve) => process.once('exit', resolve));

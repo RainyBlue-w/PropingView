@@ -425,6 +425,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 + "\"connectionName\":" + JsonQuote(connName) + ","
                 + "\"historyWindowVersion\":1,"
                 + "\"symbolCatalogVersion\":2,"
+                + "\"copySnapshotVersion\":1,"
                 + "\"executionArchiveVersion\":1,\"archive\":" + ExecutionArchiveStatusJson() + ","
                 + "\"time\":" + ToUnix(DateTime.Now).ToString(CultureInfo.InvariantCulture)
                 + "}";
@@ -1070,11 +1071,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (!q.TryGetValue("account", out accName)) { WriteJson(ns, 400, "{\"error\":\"missing account\"}"); return; }
             Account acc = FindAccount(accName);
             if (acc == null) { WriteJson(ns, 404, "{\"error\":\"unknown account\"}"); return; }
+            bool copyStrict = q.ContainsKey("copyStrict") && q["copyStrict"] == "true";
 
             Position[] snapshot;
-            try { snapshot = acc.Positions.ToArray(); }
+            try { lock (acc.Positions) snapshot = acc.Positions.ToArray(); }
             catch (Exception ex)
             {
+                if (copyStrict) { WriteJson(ns, 503, "{\"error\":\"unable to read complete positions\"}"); return; }
                 snapshot = new Position[0];
                 NinjaTrader.Code.Output.Process(
                     "TvBridgeAddOn 读取持仓失败(" + accName + "): " + ex.Message, PrintTo.OutputTab1);
@@ -1104,7 +1107,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     if (!kv.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
                     string instrName = kv.Key.Substring(prefix.Length);
-                    if (emitted.Contains(instrName)) continue;
+                    if (emitted.Contains(instrName))
+                    {
+                        if (copyStrict)
+                        {
+                            var native = snapshot.First(p => p.Instrument.FullName == instrName && p.MarketPosition != MarketPosition.Flat);
+                            long nativeQuantity = native.MarketPosition == MarketPosition.Long ? native.Quantity : -native.Quantity;
+                            if (nativeQuantity != kv.Value.Quantity)
+                            { WriteJson(ns, 503, "{\"error\":\"position snapshot is updating; cannot confirm copy state\"}"); return; }
+                        }
+                        continue;
+                    }
                     if (!first) sb.Append(',');
                     first = false;
                     sb.Append("{\"instrument\":").Append(JsonQuote(instrName))
@@ -1114,7 +1127,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                       .Append("}");
                 }
             }
-            sb.Append("]}");
+            sb.Append(copyStrict ? "],\"copyStrict\":true}" : "]}");
             WriteJson(ns, 200, sb.ToString());
         }
 
@@ -1124,18 +1137,21 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (!q.TryGetValue("account", out accName)) { WriteJson(ns, 400, "{\"error\":\"missing account\"}"); return; }
             Account acc = FindAccount(accName);
             if (acc == null) { WriteJson(ns, 404, "{\"error\":\"unknown account\"}"); return; }
+            bool copyStrict = q.ContainsKey("copyStrict") && q["copyStrict"] == "true";
 
             Order[] snapshot;
-            try { snapshot = acc.Orders.ToArray(); }
+            try { lock (acc.Orders) snapshot = acc.Orders.ToArray(); }
             catch (Exception ex)
             {
+                if (copyStrict) { WriteJson(ns, 503, "{\"error\":\"unable to read complete orders\"}"); return; }
                 snapshot = new Order[0];
                 NinjaTrader.Code.Output.Process(
                     "TvBridgeAddOn 读取订单失败(" + accName + "): " + ex.Message, PrintTo.OutputTab1);
             }
 
             DateTime cutoff = DateTime.Now.AddHours(-6);
-            var list = snapshot
+            var list = copyStrict ? snapshot.Where(o => o != null && o.OrderState != OrderState.Filled
+                && o.OrderState != OrderState.Cancelled && o.OrderState != OrderState.Rejected).ToList() : snapshot
                 .Where(o => IsWorkingState(o.OrderState) || o.Time > cutoff)
                 .OrderByDescending(o => o.Time)
                 .Take(60)
@@ -1162,7 +1178,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                   .Append(",\"time\":").Append(ToUnix(o.Time).ToString(CultureInfo.InvariantCulture))
                   .Append("}");
             }
-            sb.Append("]}");
+            sb.Append(copyStrict ? "],\"copyStrict\":true}" : "]}");
             WriteJson(ns, 200, sb.ToString());
         }
 
