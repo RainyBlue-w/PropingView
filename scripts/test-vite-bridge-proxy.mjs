@@ -21,11 +21,19 @@ const mock = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ url: req.url, method: req.method, body: Buffer.concat(chunks).toString('utf8') }));
 });
 mock.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+const atasMock = http.createServer((req, res) => {
+  res.setHeader('X-Mock-Provider', 'atas');
+  mock.emit('request', req, res);
+});
+atasMock.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
 await new Promise(resolve => mock.listen(0, '127.0.0.1', resolve));
+await new Promise(resolve => atasMock.listen(0, '127.0.0.1', resolve));
 const target = `http://127.0.0.1:${mock.address().port}`;
+const atasTarget = `http://127.0.0.1:${atasMock.address().port}`;
 const { config } = await loadConfigFromFile({ command: 'serve', mode: 'test' }, path.resolve('app/vite.config.ts'));
 function options(mode) {
-  const proxy = Object.fromEntries(Object.entries(config[mode].proxy).map(([key, value]) => [key, { ...value, target }]));
+  assert.ok(config[mode].proxy['/atas/api'], 'ATAS proxy must be registered');
+  const proxy = Object.fromEntries(Object.entries(config[mode].proxy).map(([key, value]) => [key, { ...value, target: key === '/atas/api' ? atasTarget : target }]));
   return {
     ...config, configFile: false, root: path.resolve('app'), logLevel: 'silent',
     cacheDir: path.resolve('.tmp-webbridge', `vite-proxy-${process.pid}-${mode}`),
@@ -46,7 +54,15 @@ try {
     assert.equal(echoed.method, 'POST');
     assert.equal(echoed.body, payload);
     assert.equal((await fetch(base + '/api/rejected')).status, 409);
-    const response = await fetch(base + '/api/stream?symbol=NQ%20SEP26', { signal: AbortSignal.timeout(2500) });
+    const atas = await fetch(base + '/atas' + query);
+    assert.equal(atas.headers.get('x-mock-provider'), 'atas');
+    assert.equal((await atas.json()).url, query);
+    const atasOrder = await fetch(base + '/atas/api/order/place', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload });
+    assert.equal(atasOrder.headers.get('x-mock-provider'), 'atas');
+    assert.equal((await atasOrder.json()).body, payload);
+    assert.equal((await fetch(base + '/atas/api/rejected')).status, 409);
+    for (const prefix of ['', '/atas']) {
+    const response = await fetch(base + prefix + '/api/stream?symbol=NQ%20SEP26', { signal: AbortSignal.timeout(2500) });
     assert.match(response.headers.get('content-type'), /text\/event-stream/);
     const reader = response.body.getReader();
     const frame = await reader.read();
@@ -54,7 +70,8 @@ try {
     await reader.cancel();
     for (let i = 0; i < 40 && streams.size; i++) await new Promise(resolve => setTimeout(resolve, 50));
     assert.equal(streams.size, 0, 'closing the browser stream must release the bridge subscription');
-    console.log(`PASS Vite ${name}: query strings, UTF-8 POST body, error status and live SSE forwarding`);
+    }
+    console.log(`PASS Vite ${name}: independent NT8/ATAS routes, query strings, UTF-8 POST body, error status and live SSE forwarding`);
   }
   for (const socket of sockets) socket.destroy();
   await new Promise(resolve => mock.close(resolve));
@@ -62,11 +79,13 @@ try {
     const response = await fetch(`http://127.0.0.1:${service.httpServer.address().port}/api/status`);
     assert.equal(response.status, 502);
     assert.ok((await response.json()).error);
+    assert.equal((await fetch(`http://127.0.0.1:${service.httpServer.address().port}/atas/api/status`)).status, 200, 'ATAS remains available with NT8 offline');
     console.log(`PASS Vite ${name}: offline bridge returns a JSON error`);
   }
 } finally {
   for (const socket of sockets) socket.destroy();
   mock.close();
+  atasMock.close();
   if (production) {
     production.httpServer.closeAllConnections();
     await new Promise(resolve => production.httpServer.close(resolve));

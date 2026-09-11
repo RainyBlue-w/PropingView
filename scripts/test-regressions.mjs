@@ -6,7 +6,7 @@ import ts from '../app/node_modules/typescript/lib/typescript.js';
 
 const out = path.resolve('.tmp-webbridge/unit');
 fs.mkdirSync(out, { recursive: true });
-for (const name of ['config', 'nt8Trading', 'nt8Bridge', 'simTrading', 'tvDatafeed', 'replaySession']) {
+for (const name of ['config', 'bridgeAccounts', 'nt8Trading', 'nt8Bridge', 'simTrading', 'symbolSearch', 'tvDatafeed', 'replaySession']) {
   const source = fs.readFileSync(`app/src/lib/${name}.ts`, 'utf8');
   const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
   fs.writeFileSync(path.join(out, `${name}.mjs`), js.replace(/from '(.\/.+?)'/g, "from '$1.mjs'"));
@@ -129,5 +129,19 @@ await test('SSE reconnect backfills missed bars before releasing queued live fra
     connection.onmessage({ data: JSON.stringify(bars(1700000240, 1)[0]) });
     assert.equal(seen.at(-1), 1700000180);
   } finally { globalThis.fetch = originalFetch; globalThis.EventSource = originalSse; }
+});
+await test('search resolves a contract missing from the catalog and discards the previous source response', async () => {
+  const native = { symbol: 'NQ 09-26', name: 'Nasdaq September', tickSize: .25, type: 'futures' };
+  let finish;
+  const adapter = { getSymbols: async () => [], getHistory: async () => [], subscribe: () => () => {},
+    resolve: async symbol => { assert.equal(symbol, native.symbol); return native; } };
+  const feed = new TvDatafeed(adapter);
+  assert.equal(await feed.lookupSymbol(' NQ 09-26 '), native);
+  adapter.resolve = () => new Promise(resolve => { finish = resolve; });
+  const pending = feed.lookupSymbol(native.symbol);
+  feed.setAdapter({ ...adapter, resolve: undefined });
+  finish(native);
+  assert.equal(await pending, null, 'an old source contract cannot enter the current search results');
+  assert.equal(await feed.lookupSymbol(native.symbol), null, 'a source without direct lookup remains supported');
 });
 console.log(`${passed} regression scenarios passed`);

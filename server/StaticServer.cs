@@ -17,6 +17,7 @@ namespace Nt8Terminal
     {
         // 桥接始终留在本机；浏览器仅连接前端服务器，无需开放 8090 端口。
         private const string BridgeOrigin = "http://127.0.0.1:8090";
+        private const string AtasBridgeOrigin = "http://127.0.0.1:8091";
         private const int BridgeTimeoutMs = 30000;
         private const int MaxBodyBytes = 16 * 1024 * 1024;
 
@@ -91,6 +92,7 @@ namespace Nt8Terminal
             Console.WriteLine("NT8 行情终端已启动:  " + browserUrl);
             Console.WriteLine("站点目录: " + root);
             Console.WriteLine("监听地址: " + address + ":" + port + "；/api/* 转发至 " + BridgeOrigin);
+            Console.WriteLine("ATAS X: /atas/api/* 转发至 " + AtasBridgeOrigin + "/api/*");
             Console.WriteLine("关闭本窗口(或在任务管理器结束 NT8Terminal.exe)即停止服务。");
             if (openBrowser)
                 try { System.Diagnostics.Process.Start(browserUrl); } catch { }
@@ -121,14 +123,15 @@ namespace Nt8Terminal
                 if (request == null) return;
 
                 string rawPath = request.Target.Split('?')[0];
-                if (rawPath == "/api" || rawPath.StartsWith("/api/", StringComparison.Ordinal))
+                bool atas = rawPath == "/atas/api" || rawPath.StartsWith("/atas/api/", StringComparison.Ordinal);
+                if (atas || rawPath == "/api" || rawPath.StartsWith("/api/", StringComparison.Ordinal))
                 {
                     if (request.Method != "GET" && request.Method != "POST")
                     {
                         WriteJsonError(ns, 405, "Method Not Allowed", "Only GET and POST are supported");
                         return;
                     }
-                    ProxyApi(client, ns, request);
+                    ProxyApi(client, ns, request, atas);
                     return;
                 }
                 if (request.Method != "GET") { WriteSimple(ns, 405, "Method Not Allowed"); return; }
@@ -232,13 +235,13 @@ namespace Nt8Terminal
             }
         }
 
-        private static void ProxyApi(TcpClient client, NetworkStream downstream, Request request)
+        private static void ProxyApi(TcpClient client, NetworkStream downstream, Request request, bool atas)
         {
             HttpWebRequest upstream = null;
             bool responseStarted = false;
             try
             {
-                upstream = (HttpWebRequest)WebRequest.Create(BridgeOrigin + request.Target);
+                upstream = (HttpWebRequest)WebRequest.Create((atas ? AtasBridgeOrigin : BridgeOrigin) + (atas ? request.Target.Substring(5) : request.Target));
                 upstream.Proxy = null;
                 upstream.Method = request.Method;
                 upstream.AllowAutoRedirect = false;
@@ -309,12 +312,12 @@ namespace Nt8Terminal
                 if (!responseStarted)
                 {
                     bool timeout = error.Status == WebExceptionStatus.Timeout;
-                    WriteJsonError(downstream, timeout ? 504 : 502, timeout ? "Gateway Timeout" : "Bad Gateway", timeout ? "NT8 bridge request timed out" : "NT8 bridge is unavailable");
+                    WriteJsonError(downstream, timeout ? 504 : 502, timeout ? "Gateway Timeout" : "Bad Gateway", (atas ? "ATAS X" : "NT8") + (timeout ? " bridge request timed out" : " bridge is unavailable"));
                 }
             }
             catch
             {
-                if (!responseStarted) WriteJsonError(downstream, 502, "Bad Gateway", "NT8 bridge proxy failed");
+                if (!responseStarted) WriteJsonError(downstream, 502, "Bad Gateway", (atas ? "ATAS X" : "NT8") + " bridge proxy failed");
             }
             finally { if (upstream != null) upstream.Abort(); }
         }

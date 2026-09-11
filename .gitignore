@@ -1,6 +1,7 @@
 # 依赖与构建产物
 node_modules/
 app/dist/
+atas-bridge/dist/
 
 # 本地编译/调试临时产物
 .build-check/

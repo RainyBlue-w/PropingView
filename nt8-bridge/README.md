@@ -1,5 +1,13 @@
 # NT8 行情终端 — 本地部署 TradingView + NinjaTrader 8 数据对接
 
+## 主力合约搜索
+
+网页的 NT8 搜索每个期货品种只显示 NT8 换月规则选定的当前月份，使用原生 `MasterInstrument.GetNextExpiry(DateTime.Now)`，不是按成交量另算主力。每次重开搜索更新结果；股票、外汇等非期货维持原列表。
+
+搜索请求使用 `/api/symbols?currentOnly=true` 和 `/api/resolve?symbol=...&currentOnly=true`，非当前期货月份不会作为搜索结果返回。普通合约解析、已打开图表、历史交易详情及持仓仍保留原生月份，不自动换仓。ATAS 搜索不受影响。
+
+复制新版 `TvBridgeAddOn.cs` 后，在 NT8 NinjaScript Editor 按 **F5 编译并重启 NT8**；`/api/status.symbolCatalogVersion` 为 `2` 表示已加载新版。旧桥会在搜索栏提示升级。
+
 ## 架构
 
 ```

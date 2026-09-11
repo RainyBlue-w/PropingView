@@ -1,8 +1,10 @@
 import { isSimTradingState, type SimTradingState } from './simTrading';
+import type { BridgeProvider } from './config';
 
 export const REPLAY_SESSION_PREFIX = 'nt8-terminal-replay-session-v1:';
 
 export interface NewReplaySessionInput {
+  provider?: BridgeProvider;
   name: string;
   symbol: string;
   /** Unix seconds. */
@@ -11,6 +13,7 @@ export interface NewReplaySessionInput {
 }
 
 export interface ReplaySession extends NewReplaySessionInput {
+  provider: BridgeProvider;
   version: 1;
   id: string;
   /** Wall-clock milliseconds, distinct from the replay cursor. */
@@ -35,6 +38,7 @@ export function isReplaySession(value: unknown): value is ReplaySession {
   if (!value || typeof value !== 'object') return false;
   const session = value as ReplaySession;
   return session.version === 1 && typeof session.id === 'string' && session.id.length > 0
+    && (session.provider === 'nt8' || session.provider === 'atas')
     && typeof session.name === 'string' && session.name.trim().length > 0
     && typeof session.symbol === 'string' && session.symbol.trim().length > 0
     && Number.isFinite(session.createdAt) && Number.isFinite(session.updatedAt)
@@ -48,6 +52,8 @@ export function isReplaySession(value: unknown): value is ReplaySession {
 }
 
 export function createReplaySession(input: NewReplaySessionInput): ReplaySession {
+  const provider = input.provider ?? 'nt8';
+  if (provider !== 'nt8' && provider !== 'atas') throw new Error('回放行情来源无效');
   const name = input.name.trim();
   const symbol = input.symbol.trim();
   if (!name || !symbol) throw new Error('请填写会话名称和完整合约名');
@@ -58,6 +64,7 @@ export function createReplaySession(input: NewReplaySessionInput): ReplaySession
   const now = Date.now();
   return {
     version: 1,
+    provider,
     id: globalThis.crypto?.randomUUID?.() ?? `${now}-${Math.random().toString(36).slice(2)}`,
     name, symbol,
     startTime: input.startTime,
@@ -75,9 +82,10 @@ export function createReplaySession(input: NewReplaySessionInput): ReplaySession
 
 /** Each session is one atomic localStorage write; a quota failure preserves its previous snapshot. */
 export function saveReplaySession(session: ReplaySession): void {
-  if (!isReplaySession(session)) throw new Error('回放快照不完整,尚未保存');
+  const normalized = { ...session, provider: session.provider ?? 'nt8' };
+  if (!isReplaySession(normalized)) throw new Error('回放快照不完整,尚未保存');
   try {
-    localStorage.setItem(`${REPLAY_SESSION_PREFIX}${session.id}`, JSON.stringify(session));
+    localStorage.setItem(`${REPLAY_SESSION_PREFIX}${session.id}`, JSON.stringify(normalized));
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`回放会话保存失败：${reason}。当前会话仍保留在内存中，请勿刷新或关闭页面。`);
@@ -109,7 +117,10 @@ export function loadReplaySessions(): { sessions: ReplaySession[]; errors: strin
       try {
         const raw = localStorage.getItem(key);
         if (raw === null) continue;
-        const parsed: unknown = JSON.parse(raw);
+        const stored: unknown = JSON.parse(raw);
+        const parsed = stored && typeof stored === 'object' && !Array.isArray(stored)
+          ? { ...stored, provider: ('provider' in stored ? stored.provider : undefined) ?? 'nt8' }
+          : stored;
         if (!isReplaySession(parsed) || key !== `${REPLAY_SESSION_PREFIX}${parsed.id}`) {
           throw new Error('快照内容或版本无效');
         }

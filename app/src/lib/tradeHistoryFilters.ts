@@ -1,5 +1,7 @@
 import type { Nt8Account, Nt8Execution } from './nt8Trading';
 import { compareExecutions, executionTime } from './tradeAnalytics';
+import { bridgeProviderName } from './config';
+import { migrateLegacyAccount, parseBridgeAccount } from './bridgeAccounts';
 
 const ACCOUNT_GROUPS_KEY = 'nt8-terminal-history-account-groups-v1';
 export const UNKNOWN_ACCOUNT_GROUP = '未分组';
@@ -16,7 +18,7 @@ export function getTradeAccountGroups(): TradeAccountGroups {
       const entries: unknown = JSON.parse(localStorage.getItem(ACCOUNT_GROUPS_KEY) || '[]');
       if (Array.isArray(entries)) {
         for (const entry of entries) {
-          if (Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string' && entry[0] && typeof entry[1] === 'string' && entry[1]) saved.set(entry[0], entry[1]);
+          if (Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string' && entry[0] && typeof entry[1] === 'string' && entry[1]) saved.set(migrateLegacyAccount(entry[0]), /^bridge:/.test(entry[0]) ? entry[1] : `NT8 · ${entry[1]}`);
         }
       }
     } catch { /* Missing or unavailable metadata does not hide archived executions. */ }
@@ -47,7 +49,7 @@ export function rememberTradeAccounts(accounts: Nt8Account[]): void {
 
 const accountName = (row: Nt8Execution) => row.account || '未知账户';
 const symbolName = (row: Nt8Execution) => row.instrument || '未知合约';
-const groupName = (account: string, groups: TradeAccountGroups) => groups.get(account) || UNKNOWN_ACCOUNT_GROUP;
+const groupName = (account: string, groups: TradeAccountGroups) => groups.get(account) || (/^bridge:/.test(account) ? `${bridgeProviderName(parseBridgeAccount(account).provider)} · ${UNKNOWN_ACCOUNT_GROUP}` : UNKNOWN_ACCOUNT_GROUP);
 
 export function tradeHistoryFilterOptions(rows: Nt8Execution[], groups: TradeAccountGroups, selectedGroup = '') {
   const allAccounts = [...new Set(rows.map(accountName))].sort((a, b) => a.localeCompare(b));

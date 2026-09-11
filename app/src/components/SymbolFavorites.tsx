@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { bridgeStorageKey, type BridgeProvider } from '@/lib/config';
+import { filterSymbols } from '@/lib/symbolSearch';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Search, Star, X } from 'lucide-react';
 import type { SymbolInfo } from '@/types/market';
 
@@ -10,11 +12,9 @@ import type { SymbolInfo } from '@/types/market';
  * - 星标按钮收藏/取消当前合约;收藏列表持久化在 localStorage
  */
 
-const FAV_KEY = 'nt8-terminal-fav-symbols';
-
-function loadFavs(): string[] {
+function loadFavs(storageKey: string): string[] {
   try {
-    const v = JSON.parse(localStorage.getItem(FAV_KEY) || '[]');
+    const v = JSON.parse(localStorage.getItem(storageKey) || '[]');
     return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
   } catch {
     return [];
@@ -22,21 +22,27 @@ function loadFavs(): string[] {
 }
 
 interface Props {
+  provider?: BridgeProvider;
   dragHandle?: ReactNode;
-  /** 拉取候选合约列表(NT8 合约库) */
+  /** 拉取当前行情源的候选合约列表 */
   listSymbols: () => Promise<SymbolInfo[]>;
+  /** 按完整名称查询未出现在候选列表中的合约 */
+  resolveSymbol?: (symbol: string) => Promise<SymbolInfo | null>;
   /** 当前图表合约 */
   current: string;
   /** 选中合约时切换图表 */
   onSelect: (symbol: string) => void;
 }
 
-export default function SymbolFavorites({ listSymbols, current, onSelect, dragHandle }: Props) {
-  const [favs, setFavs] = useState<string[]>(loadFavs);
+export default function SymbolFavorites({ listSymbols, resolveSymbol, current, onSelect, dragHandle, provider = 'nt8' }: Props) {
+  const storageKey = bridgeStorageKey('nt8-terminal-fav-symbols', provider);
+  const [favs, setFavs] = useState<string[]>(() => loadFavs(storageKey));
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [resolved, setResolved] = useState<{ query: string; symbol: SymbolInfo | null } | null>(null);
   const boxRef = useRef<HTMLDivElement>(null);
 
   // 点击外部收起下拉;图表在 iframe 里,点进 iframe 时外层 document 收不到
@@ -55,20 +61,53 @@ export default function SymbolFavorites({ listSymbols, current, onSelect, dragHa
     };
   }, [open]);
 
-  // 首次打开下拉时加载候选列表
+  // 每次打开更新目录，避免新增月份或重连后一直使用旧候选。
   useEffect(() => {
-    if (!open || symbols.length > 0) return;
-    setLoading(true);
+    if (!open) return;
+    let cancelled = false;
     void listSymbols()
-      .then(setSymbols)
-      .catch(() => setSymbols([]))
-      .finally(() => setLoading(false));
-  }, [open, symbols.length, listSymbols]);
+      .then(next => { if (!cancelled) setSymbols(next); })
+      .catch(error => {
+        if (!cancelled) {
+          setSymbols([]);
+          setResolved(null);
+          setLoadError(error instanceof Error ? error.message : '合约列表加载失败，请检查桥接连接后重新打开搜索。');
+        }
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [open, listSymbols]);
+
+  const showResults = () => {
+    if (!open) {
+      setLoading(true);
+      setLoadError(null);
+      setResolved(null);
+    }
+    setOpen(true);
+  };
+
+  const q = query.trim();
+  const filtered = useMemo(() => filterSymbols(symbols, q), [symbols, q]);
+  const needsResolve = open && !!q && filtered.length === 0 && !loading && !loadError && !!resolveSymbol;
+  useEffect(() => {
+    if (!needsResolve || !resolveSymbol) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      void resolveSymbol(q)
+        .then(symbol => { if (!cancelled) setResolved({ query: q, symbol }); })
+        .catch(() => { if (!cancelled) setResolved({ query: q, symbol: null }); });
+    }, 250);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [needsResolve, q, resolveSymbol]);
+  const resolving = needsResolve && resolved?.query !== q;
+  const matches = filtered.length === 0 && resolved?.query === q && resolved.symbol
+    ? [resolved.symbol] : filtered;
 
   const persist = (next: string[]) => {
     setFavs(next);
     try {
-      localStorage.setItem(FAV_KEY, JSON.stringify(next));
+      localStorage.setItem(storageKey, JSON.stringify(next));
     } catch {
       /* ignore */
     }
@@ -82,27 +121,10 @@ export default function SymbolFavorites({ listSymbols, current, onSelect, dragHa
     setOpen(false);
   };
 
-  const q = query.trim().toLowerCase();
-  /** 匹配分级:合约代码从头匹配 > 代码包含 > 名称从头 > 名称包含(搜 NQ 时 MNQ 不得排在 NQ 前面) */
-  const rankOf = (s: SymbolInfo): number => {
-    if (!q) return 0;
-    const sym = s.symbol.toLowerCase();
-    if (sym.startsWith(q)) return 0;
-    if (sym.includes(q)) return 1;
-    const nm = (s.name ?? '').toLowerCase();
-    if (nm.startsWith(q)) return 2;
-    return 3;
-  };
-  const filtered = symbols
-    .filter(
-      (s) =>
-        !q || s.symbol.toLowerCase().includes(q) || (s.name ?? '').toLowerCase().includes(q),
-    )
-    .sort((a, b) => rankOf(a) - rankOf(b) || a.symbol.localeCompare(b.symbol));
   // 收藏的固定在结果最上方(组内同样已按匹配分级排序),其余按名称
   const rows = [
-    ...filtered.filter((s) => favs.includes(s.symbol)),
-    ...filtered.filter((s) => !favs.includes(s.symbol)),
+    ...matches.filter((s) => favs.includes(s.symbol)),
+    ...matches.filter((s) => !favs.includes(s.symbol)),
   ].slice(0, 60);
 
   const isFavCurrent = !!current && favs.includes(current);
@@ -110,7 +132,7 @@ export default function SymbolFavorites({ listSymbols, current, onSelect, dragHa
   return (
     <div
       ref={boxRef}
-      className="relative flex max-w-full flex-wrap items-center gap-1 rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)]/95 px-1.5 py-1 shadow-lg backdrop-blur"
+      className="relative flex max-w-full flex-nowrap items-center gap-1 rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)]/95 px-1 py-0.5 shadow-lg backdrop-blur lg:flex-wrap lg:px-1.5 lg:py-1"
     >
       {dragHandle}
       {/* 搜索框(聚焦/输入展开结果,收藏置顶) */}
@@ -118,17 +140,18 @@ export default function SymbolFavorites({ listSymbols, current, onSelect, dragHa
         <Search className="pointer-events-none absolute left-1.5 top-1/2 h-3 w-3 -translate-y-1/2 text-[var(--tv-muted)]" />
         <input
           value={query}
-          onFocus={() => setOpen(true)}
+          onFocus={showResults}
           onChange={(e) => {
             setQuery(e.target.value);
-            setOpen(true);
+            showResults();
           }}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && rows.length > 0) pick(rows[0].symbol);
+            if (e.key === 'Enter' && !loading && !loadError && rows.length > 0) pick(rows[0].symbol);
             if (e.key === 'Escape') setOpen(false);
           }}
           placeholder="搜索合约…"
-          className="h-6 w-36 rounded border border-[var(--tv-border)] bg-[var(--tv-bg)] pl-5 pr-1.5 font-mono text-[11px] text-[var(--tv-text)] outline-none focus:border-[#2962ff]"
+          aria-label="搜索合约"
+          className="h-7 w-32 rounded border border-[var(--tv-border)] bg-[var(--tv-bg)] pl-5 pr-1.5 font-mono text-sm text-[var(--tv-text)] outline-none focus:border-[#2962ff] focus:text-base lg:h-6 lg:w-36 lg:text-[11px] lg:focus:text-[11px]"
         />
       </div>
 
@@ -143,6 +166,7 @@ export default function SymbolFavorites({ listSymbols, current, onSelect, dragHa
       </button>
 
       {/* 收藏 chip 列表 */}
+      {favs.length > 0 && <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto overscroll-x-contain lg:contents">
       {favs.map((s) => (
         <span
           key={s}
@@ -152,36 +176,44 @@ export default function SymbolFavorites({ listSymbols, current, onSelect, dragHa
               : 'cursor-pointer text-[var(--tv-text)] hover:bg-[#2962ff]/15'
           }`}
         >
-          <button onClick={() => pick(s)} className="cursor-pointer">
+          <button onClick={() => pick(s)} className="min-h-6 cursor-pointer lg:min-h-0">
             {s}
           </button>
           <button
             onClick={() => toggleFav(s)}
-            className="hidden rounded-sm p-px opacity-70 hover:opacity-100 group-hover:block"
+            className="rounded-sm p-1 opacity-70 hover:opacity-100 lg:hidden lg:p-px lg:group-hover:block"
             title={`取消收藏 ${s}`}
           >
             <X className="h-2.5 w-2.5" />
           </button>
         </span>
       ))}
+      </div>}
 
       {/* 搜索结果下拉 */}
       {open && (
-        <div className="absolute left-0 top-full z-50 mt-1 w-72 rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)] shadow-xl">
-          <div className="max-h-80 overflow-y-auto py-1">
+        <div className="absolute left-0 top-full z-50 mt-1 w-72 max-w-[calc(100vw-24px)] rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)] shadow-xl">
+          <div className="max-h-[min(20rem,50dvh)] overflow-y-auto overscroll-contain py-1">
             {loading && (
               <div className="px-3 py-2 text-[11px] text-[var(--tv-muted)]">加载合约列表…</div>
             )}
-            {!loading && rows.length === 0 && (
+            {!loading && loadError && (
+              <div className="px-3 py-2 text-[11px] text-amber-500">{loadError}</div>
+            )}
+            {resolving && (
+              <div className="px-3 py-2 text-[11px] text-[var(--tv-muted)]">正在查询合约…</div>
+            )}
+            {!loading && !resolving && !loadError && rows.length === 0 && (
               <div className="px-3 py-2 text-[11px] text-[var(--tv-muted)]">无匹配合约</div>
             )}
-            {!loading &&
+            {!loading && !loadError &&
               rows.map((s, i) => {
                 const fav = favs.includes(s.symbol);
                 return (
                   <div
                     key={s.symbol}
-                    className={`flex cursor-pointer items-center gap-1.5 px-2 py-1 text-xs transition-colors hover:bg-[#2962ff]/10 ${
+                    data-symbol-result={s.symbol}
+                    className={`flex min-h-8 cursor-pointer items-center gap-1.5 px-2 py-1 text-xs transition-colors hover:bg-[#2962ff]/10 lg:min-h-0 ${
                       s.symbol === current ? 'bg-[#2962ff]/10' : ''
                     }`}
                     onClick={() => pick(s.symbol)}

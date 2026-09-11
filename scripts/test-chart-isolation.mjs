@@ -25,7 +25,9 @@ function compile(filename, imports = {}) {
 
 const layouts = compile('app/src/lib/tvLayoutStore.ts');
 const events = compile('app/src/lib/tvLayoutEvents.ts');
-const { TvDatafeed } = compile('app/src/lib/tvDatafeed.ts');
+const { TvDatafeed } = compile('app/src/lib/tvDatafeed.ts', {
+  './symbolSearch': compile('app/src/lib/symbolSearch.ts'),
+});
 const LEGACY = 'nt8-terminal-tv-layout';
 const PRIMARY = 'nt8-terminal-tv-layouts-v2';
 const state = symbol => ({ charts: [{ panes: [{ sources: [{ type: 'MainSeries', state: { symbol, interval: '5' } }] }] }] });
@@ -117,6 +119,8 @@ function mount(props = {}) {
   return { widget: widgets.at(-1), unmount: () => cleanups.forEach(cleanup => cleanup?.()) };
 }
 const primary = mount();
+// ChartTerminal owns the active debug reference; individual chart mounts preserve it.
+window.__lastWidget = primary.widget;
 const pane = mount({ symbol: 'ES SEP26', layoutScope: scope });
 primary.widget.ready();
 pane.widget.ready();

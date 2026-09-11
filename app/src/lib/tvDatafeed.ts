@@ -1,4 +1,5 @@
 import type { Bar, FeedAdapter, SymbolInfo } from '@/types/market';
+import { filterSymbols } from './symbolSearch';
 
 /** TradingView 周期字符串 -> 秒 */
 export function resolutionToSeconds(resolution: string): number {
@@ -122,17 +123,31 @@ export class TvDatafeed {
     this.onAdapterSwapped?.();
   }
 
-  async listSymbols(): Promise<SymbolInfo[]> {
+  async listSymbols(searchOnly = false): Promise<SymbolInfo[]> {
     // UI 调用没有取消回调；切换期间重新读取当前源，不能返回旧合约元数据。
     for (;;) {
       const generation = this.adapterGeneration;
       const adapter = this.adapter;
       try {
-        const symbols = await adapter.getSymbols();
+        const symbols = await (searchOnly && adapter.getSearchSymbols ? adapter.getSearchSymbols() : adapter.getSymbols());
         if (generation === this.adapterGeneration) return symbols;
       } catch (err) {
         if (generation === this.adapterGeneration) throw err;
       }
+    }
+  }
+
+  /** 搜索栏的完整名称解析；切换来源后丢弃旧桥返回的结果。 */
+  async lookupSymbol(symbol: string): Promise<SymbolInfo | null> {
+    const generation = this.adapterGeneration;
+    const adapter = this.adapter;
+    const resolve = adapter.searchResolve ?? adapter.resolve;
+    if (!resolve) return null;
+    try {
+      const result = await resolve.call(adapter, symbol.trim());
+      return generation === this.adapterGeneration ? result : null;
+    } catch {
+      return null;
     }
   }
 
@@ -151,7 +166,7 @@ export class TvDatafeed {
           supports_marks: false,
           supports_timescale_marks: false,
           supports_time: false,
-          exchanges: [{ value: EXCHANGE, name: EXCHANGE, desc: 'NinjaTrader 8 数据桥' }],
+          exchanges: [{ value: this.adapter.exchange || EXCHANGE, name: this.adapter.exchange || EXCHANGE, desc: `${this.adapter.exchange || EXCHANGE} 数据桥` }],
           symbols_types: [
             { name: '期货', value: 'futures' },
             { name: '其他', value: 'other' },
@@ -172,25 +187,19 @@ export class TvDatafeed {
     const query = userInput.trim().toLowerCase();
     let symbols: SymbolInfo[];
     try {
-      symbols = await adapter.getSymbols();
+      symbols = await (adapter.getSearchSymbols ? adapter.getSearchSymbols() : adapter.getSymbols());
       this.assertAdapterGeneration(generation);
     } catch {
       onResult([]);
       return;
     }
-    const matched = symbols
-      .filter(
-        (s) =>
-          !query ||
-          s.symbol.toLowerCase().includes(query) ||
-          s.name.toLowerCase().includes(query),
-      )
-      .slice(0, 30);
+    const matched = filterSymbols(symbols, userInput).slice(0, 30);
 
-    // 列表里没匹配到时,尝试按输入的原名直接向后端解析(如手动输入新月份合约)
-    if (matched.length === 0 && query && adapter.resolve) {
+    // 搜索补查遵守候选目录限制；普通图表 resolveSymbol 仍能精确打开历史合约。
+    const resolve = adapter.searchResolve ?? adapter.resolve;
+    if (matched.length === 0 && query && resolve) {
       try {
-        const resolved = await adapter.resolve(userInput.trim());
+        const resolved = await resolve.call(adapter, userInput.trim());
         if (resolved) matched.push(resolved);
       } catch {
         /* 未解析到则返回空 */
@@ -207,7 +216,7 @@ export class TvDatafeed {
         symbol: s.symbol,
         full_name: s.symbol,
         description: s.name,
-        exchange: EXCHANGE,
+        exchange: s.exchange || this.adapter.exchange || EXCHANGE,
         ticker: s.symbol,
         type: s.type ?? 'futures',
       })),
@@ -245,8 +254,8 @@ export class TvDatafeed {
         type: found.type ?? 'futures',
         session: '24x7',
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Etc/UTC',
-        exchange: EXCHANGE,
-        listed_exchange: EXCHANGE,
+        exchange: found.exchange || this.adapter.exchange || EXCHANGE,
+        listed_exchange: found.exchange || this.adapter.exchange || EXCHANGE,
         minmov,
         pricescale,
         has_intraday: true,

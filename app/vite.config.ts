@@ -4,6 +4,19 @@ import { defineConfig, type ProxyOptions } from "vite"
 import { inspectAttr } from 'kimi-plugin-inspect-react'
 
 const bridgeProxy: Record<string, ProxyOptions> = {
+  '/atas/api': {
+    target: 'http://127.0.0.1:8091',
+    changeOrigin: true,
+    rewrite: path => path.replace(/^\/atas(?=\/api(?:\/|\?|$))/, ''),
+    configure(proxy) {
+      proxy.on('error', (_error, _request, response) => {
+        if ('writeHead' in response && !response.headersSent) {
+          response.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
+          response.end(JSON.stringify({ error: '无法连接 ATAS X 数据桥，请确认主机上的 ATAS X 已加载桥接指标。' }));
+        }
+      });
+    },
+  },
   '/api/': {
     target: 'http://127.0.0.1:8090',
     changeOrigin: true,

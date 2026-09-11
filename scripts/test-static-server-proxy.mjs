@@ -47,9 +47,17 @@ const bridge = http.createServer(async (req, res) => {
   const body = Buffer.concat(chunks).toString('utf8');
   if (req.method === 'POST') receivedPosts++;
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-  res.end(JSON.stringify({ method: req.method, url: req.url, body, contentType: req.headers['content-type'], lastEventId: req.headers['last-event-id'] }));
+  res.end(JSON.stringify({ provider: res.getHeader('X-Mock-Provider') ?? 'nt8', method: req.method, url: req.url, body, contentType: req.headers['content-type'], lastEventId: req.headers['last-event-id'] }));
 });
 bridge.on('connection', (socket) => {
+  sockets.add(socket);
+  socket.once('close', () => sockets.delete(socket));
+});
+const atasBridge = http.createServer((req, res) => {
+  res.setHeader('X-Mock-Provider', 'atas');
+  bridge.emit('request', req, res);
+});
+atasBridge.on('connection', (socket) => {
   sockets.add(socket);
   socket.once('close', () => sockets.delete(socket));
 });
@@ -57,14 +65,18 @@ let process;
 const eventRequests = [];
 try {
   const bridgePort = await listen(bridge);
+  const atasPort = await listen(atasBridge);
   assert.notEqual(bridgePort, 8090);
+  assert.notEqual(atasPort, 8091);
   const reservation = net.createServer();
   const port = await listen(reservation);
   await close(reservation);
   const source = (await readFile(path.join(root, 'server/StaticServer.cs'), 'utf8'))
     .replace('private const string BridgeOrigin = "http://127.0.0.1:8090";', `private const string BridgeOrigin = "http://127.0.0.1:${bridgePort}";`)
+    .replace('private const string AtasBridgeOrigin = "http://127.0.0.1:8091";', `private const string AtasBridgeOrigin = "http://127.0.0.1:${atasPort}";`)
     .replace('private const int BridgeTimeoutMs = 30000;', 'private const int BridgeTimeoutMs = 800;');
   assert(!source.includes('private const string BridgeOrigin = "http://127.0.0.1:8090";'));
+  assert(!source.includes('private const string AtasBridgeOrigin = "http://127.0.0.1:8091";'));
   const sourceFile = path.join(work, 'StaticServer.cs');
   const executable = path.join(work, 'TestStaticServer.exe');
   await writeFile(sourceFile, source);
@@ -121,11 +133,20 @@ try {
   assert.equal(JSON.parse(segmentedResponse.split('\r\n\r\n')[1]).body, body.toString('utf8'));
   assert.equal(receivedPosts, 2);
 
+  const atasStatus = await fetch(origin + '/atas' + query).then(r => r.json());
+  assert.equal(atasStatus.provider, 'atas');
+  assert.equal(atasStatus.url, query, 'strip only ATAS proxy prefix and retain encoded query');
+  const atasOrder = await fetch(origin + '/atas/api/mock-order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload }).then(r => r.json());
+  assert.equal(atasOrder.provider, 'atas');
+  assert.equal(atasOrder.body, payload, 'ATAS receives original UTF-8 body');
+  assert.equal((await fetch(origin + query).then(r => r.json())).provider, 'nt8', 'NT8 keeps its independent upstream');
+  assert.equal((await fetch(origin + '/atas/api/error')).status, 409);
+
   const failure = await fetch(origin + '/api/error');
   assert.equal(failure.status, 409);
   assert.equal(failure.headers.get('retry-after'), '2');
   assert.deepEqual(await failure.json(), { ok: false, error: '订单已变更' });
-  for (const apiPath of ['/api', '/api/missing']) {
+  for (const apiPath of ['/api', '/api/missing', '/atas/api', '/atas/api/missing']) {
     const missing = await fetch(origin + apiPath);
     assert.equal(missing.status, 404);
     assert.deepEqual(await missing.json(), { error: 'API not found' });
@@ -143,7 +164,7 @@ try {
   for (let i = 0; i < 4; i++) {
     await new Promise((resolve, reject) => {
       const start = Date.now();
-      const request = http.get(origin + `/api/events?id=${i}`, (res) => {
+      const request = http.get(origin + `${i % 2 ? '/atas' : ''}/api/events?id=${i}`, (res) => {
         assert.equal(res.headers['content-type'], 'text/event-stream');
         assert.equal(res.headers['x-accel-buffering'], 'no');
         let text = '';
@@ -184,11 +205,15 @@ try {
   assert([502, 504].includes(offline.status));
   assert.match(offline.headers.get('content-type'), /application\/json/);
   assert.equal((await offline.json()).ok, false);
-  console.log('PASS static proxy: GET/query, UTF-8 POST, segmented body, HTTP errors, API no-SPA, method/path guards, concurrent/streaming SSE, disconnect cleanup, timeout/offline JSON, complete large static assets');
+  assert.equal((await fetch(origin + '/atas/api/status')).status, 200, 'NT8 offline does not disconnect ATAS');
+  await close(atasBridge);
+  assert([502, 504].includes((await fetch(origin + '/atas/api/status')).status));
+  console.log('PASS static proxy: dual-provider routing/isolation, GET/query, UTF-8 POST, segmented body, HTTP errors, API no-SPA, method/path guards, concurrent SSE, disconnect cleanup, timeout/offline JSON, complete static assets');
 } finally {
   for (const request of eventRequests) request.destroy();
   for (const socket of sockets) socket.destroy();
   if (bridge.listening) await close(bridge);
+  if (atasBridge.listening) await close(atasBridge);
   if (process && process.exitCode === null) {
     process.kill();
     await new Promise((resolve) => process.once('exit', resolve));

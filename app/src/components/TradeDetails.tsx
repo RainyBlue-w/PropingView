@@ -5,11 +5,13 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/compone
 import type { Nt8Execution } from '@/lib/nt8Trading';
 import { analyzeTrades, compareExecutions, executionDirection, executionKey, executionTime, formatMoney, type MatchedTrade } from '@/lib/tradeAnalytics';
 import { checkNt8Status, createNt8Adapter } from '@/lib/nt8Bridge';
+import { parseBridgeAccount, displayBridgeAccount } from '@/lib/bridgeAccounts';
 import type { Bar, FeedAdapter } from '@/types/market';
+import type { BridgeProvider } from '@/lib/config';
 
-interface Props { row: Nt8Execution; rows: Nt8Execution[]; trade?: MatchedTrade; unpairedQty?: number; onClose: () => void; adapter?: FeedAdapter; toTime?: number }
+interface Props { row: Nt8Execution; rows: Nt8Execution[]; trade?: MatchedTrade; unpairedQty?: number; onClose: () => void; adapter?: FeedAdapter; toTime?: number; historyProvider?: BridgeProvider }
 
-export default function TradeDetails({ row, rows, trade, unpairedQty, onClose, adapter, toTime }: Props) {
+export default function TradeDetails({ row, rows, trade, unpairedQty, onClose, adapter, toTime, historyProvider }: Props) {
   const key = executionKey(row);
   const isUnpaired = !trade && unpairedQty != null;
   const direction = executionDirection((trade?.entry || row).side);
@@ -18,11 +20,11 @@ export default function TradeDetails({ row, rows, trade, unpairedQty, onClose, a
   return <Dialog open onOpenChange={open => { if (!open) onClose(); }}>
     <DialogContent className="max-h-[92vh] overflow-auto border-[var(--tv-border)] bg-[var(--tv-panel)] text-[var(--tv-text)] sm:max-w-5xl">
       <DialogTitle>交易详情{isUnpaired ? ' · 未配对' : ''} · {row.instrument || '未知合约'}</DialogTitle>
-      <DialogDescription className="text-[var(--tv-muted)]">{row.account || '未知账户'} · {trade
+      <DialogDescription className="text-[var(--tv-muted)]">{row.accountDisplayName || displayBridgeAccount(row.account)} · {trade
         ? <><span className={`inline-flex items-center gap-1 align-middle ${direction > 0 ? 'text-[#26a69a]' : 'text-[#ef5350]'}`}>{direction > 0 ? <ArrowUp size={15} aria-hidden="true" /> : <ArrowDown size={15} aria-hidden="true" />}{direction > 0 ? '做多' : '做空'}</span> {trade.qty} · 入场 {new Date(executionTime(trade.entry) * 1000).toLocaleString('zh-CN', { hour12: false })} → 离场 {new Date(executionTime(trade.exit) * 1000).toLocaleString('zh-CN', { hour12: false })}</>
         : <>{new Date(executionTime(row) * 1000).toLocaleString('zh-CN', { hour12: false })} · {direction > 0 ? '买入' : direction < 0 ? '卖出' : '方向未知'} {isUnpaired ? unpairedQty : row.qty} @ {row.price}</>}
       </DialogDescription>
-      <DetailChart row={row} related={related} trade={trade} adapter={adapter} toTime={toTime} />
+      <DetailChart row={row} related={related} trade={trade} adapter={adapter} toTime={toTime} historyProvider={historyProvider} />
       {trade || isUnpaired ? <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4" data-paired-trade-summary>
         <div><span className="text-xs text-[var(--tv-muted)]">入场价格</span><p className="mt-1 font-mono">{trade?.entry.price ?? row.price}</p></div>
         <div><span className="text-xs text-[var(--tv-muted)]">离场价格</span><p className="mt-1 font-mono">{trade?.exit.price ?? '—'}</p></div>
@@ -42,7 +44,7 @@ export default function TradeDetails({ row, rows, trade, unpairedQty, onClose, a
   </Dialog>;
 }
 
-function DetailChart({ row, related, trade, adapter, toTime }: Pick<Props, 'row' | 'trade' | 'adapter' | 'toTime'> & { related: Nt8Execution[] }) {
+function DetailChart({ row, related, trade, adapter, toTime, historyProvider }: Pick<Props, 'row' | 'trade' | 'adapter' | 'toTime' | 'historyProvider'> & { related: Nt8Execution[] }) {
   const host = useRef<HTMLDivElement>(null);
   const [result, setResult] = useState<{ bars: Bar[]; error?: string } | null>(null);
   const start = Math.max(0, Math.min(...related.map(e => e.time)) - 3600);
@@ -53,15 +55,16 @@ function DetailChart({ row, related, trade, adapter, toTime }: Pick<Props, 'row'
     void (async () => {
       try {
         if (!row.instrument) throw new Error('成交记录缺少合约，无法取得 K 线。');
-        const status = adapter ? null : await checkNt8Status();
+        const provider = historyProvider ?? parseBridgeAccount(row.account || '').provider;
+        const status = adapter ? null : await checkNt8Status(provider);
         if (!adapter && !status) throw new Error('数据桥离线，暂时无法读取 K 线。');
-        const feed = adapter || createNt8Adapter(status || undefined);
+        const feed = adapter || createNt8Adapter(status || undefined, provider);
         const bars = await feed.getHistory(row.instrument, interval, start, end);
         if (!cancelled) setResult({ bars: [...new Map(bars.filter(b => b.time >= start && b.time <= end && [b.time, b.open, b.high, b.low, b.close].every(Number.isFinite)).map(b => [b.time, b])).values()].sort((a, b) => a.time - b.time) });
       } catch (error) { if (!cancelled) setResult({ bars: [], error: error instanceof Error ? error.message : '行情读取失败' }); }
     })();
     return () => { cancelled = true; };
-  }, [row.instrument, interval, start, end, adapter]);
+  }, [row.instrument, row.account, interval, start, end, adapter, historyProvider]);
   useEffect(() => {
     if (!host.current) return;
     const node = host.current;

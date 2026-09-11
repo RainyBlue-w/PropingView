@@ -7,7 +7,7 @@ import ts from '../app/node_modules/typescript/lib/typescript.js';
 // Transpile the current production router and both backends. Every HTTP request is intercepted.
 const output = path.resolve('.tmp-webbridge/trading-router-unit');
 fs.mkdirSync(output, { recursive: true });
-for (const name of ['config', 'nt8Trading', 'simTrading', 'tradingRouter']) {
+for (const name of ['config', 'bridgeAccounts', 'nt8Trading', 'simTrading', 'tradingRouter']) {
   const source = fs.readFileSync(`app/src/lib/${name}.ts`, 'utf8');
   const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
   fs.writeFileSync(path.join(output, `${name}.mjs`), js.replace(/from '(\.\/.+?)'/g, "from '$1.mjs'"));
@@ -83,9 +83,9 @@ try {
     for (const mutate of mutations('REAL-TEST')) await mutate();
     assert.deepEqual(network.map(call => call.endpoint), ['/api/order/place', '/api/order/cancel', '/api/order/change', '/api/position/close']);
     assert.ok(network.every(call => call.method === 'POST' && call.payload.account === 'REAL-TEST'));
-    assert.equal((await trading.getAccounts()).accounts[0].name, 'REAL-TEST');
+    assert.equal((await trading.getAccounts()).accounts[0].name, 'bridge:nt8:REAL-TEST');
     assert.equal(network.at(-1).endpoint, '/api/accounts');
-    assert.equal(network.length, 5);
+    assert.equal(network.length, 6);
   });
 } finally {
   setTradingBackend(null);

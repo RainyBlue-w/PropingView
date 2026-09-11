@@ -1,3 +1,4 @@
+import { displayBridgeAccount, parseBridgeAccount } from '@/lib/bridgeAccounts';
 import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, CheckCircle2, ChevronDown, ChevronRight, Eye, EyeOff, Loader2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -148,10 +149,16 @@ export default function TradingPanel({
   const pendingRowActions = useRef(new Set<string>());
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [ticketSymbol, setTicketSymbol] = useState(symbol);
+  const [ticketAccount, setTicketAccount] = useState(account);
   const symbolContext = useRef(0);
   useEffect(() => {
     symbolContext.current += 1;
-  }, [symbol]);
+  }, [symbol, account]);
+  // Order results belong to the account that submitted them, even if its chart symbol stays the same.
+  if (ticketAccount !== account) {
+    setTicketAccount(account);
+    setMessage(null);
+  }
   // 绝对价格仅属于当前合约；切图时同步清空，隐藏面板不影响表单。
   if (ticketSymbol !== symbol) {
     setTicketSymbol(symbol);
@@ -342,8 +349,8 @@ export default function TradingPanel({
     () => trading.closePosition(account, instrument), '平仓单已提交', '平仓失败');
 
   const inputCls =
-    'h-8 border-[var(--tv-border)] bg-[var(--tv-bg)] text-[var(--tv-text)] text-xs font-mono';
-  const labelCls = 'text-[11px] text-[var(--tv-muted)]';
+    'h-[26px] border-[var(--tv-border)] bg-[var(--tv-bg)] px-1.5 py-0.5 text-[var(--tv-text)] text-xs font-mono leading-4 focus:text-base focus:leading-4 md:text-xs lg:h-8 lg:px-3 lg:py-1 lg:text-sm lg:leading-5 lg:focus:text-sm lg:focus:leading-5';
+  const labelCls = 'text-[10px] leading-[14px] text-[var(--tv-muted)] lg:text-[11px] lg:leading-normal';
 
   /** 金额显示:缺失(旧版桥)显 —;负数前置 - 号 */
   const fmtMoney = (v?: number): string =>
@@ -362,7 +369,7 @@ export default function TradingPanel({
       <div
         key={a.name}
         onClick={() => { if (!isHidden) onAccountChange(a.name); }}
-        className={`w-full rounded border p-2.5 text-left transition-colors ${
+        className={`w-full rounded border p-2 text-left transition-colors lg:p-2.5 ${
           isHidden
             ? 'cursor-default border-[var(--tv-border)] bg-[var(--tv-bg)] opacity-40 grayscale'
             : isActive
@@ -371,14 +378,14 @@ export default function TradingPanel({
         }`}
         title={isHidden ? '已隐藏(点眼睛恢复)' : isActive ? '当前账户' : '点击切换为该账户'}
       >
-        <div className="mb-1.5 flex items-center justify-between">
-          <span className="text-xs font-bold">
-            {a.name}
+        <div className="mb-1.5 flex items-center justify-between gap-2">
+          <span className="min-w-0 break-words text-xs font-bold [overflow-wrap:anywhere]">
+            {a.displayName || displayBridgeAccount(a.name)}
             {a.connection ? (
               <span className="ml-1 font-normal text-[var(--tv-muted)]">· {a.connection}</span>
             ) : null}
           </span>
-          <span className="flex items-center gap-1.5">
+          <span className="flex shrink-0 items-center gap-1.5">
             {isActive && !isHidden && (
               <span className="rounded bg-[#2962ff] px-1.5 py-0.5 text-[10px] font-semibold text-white">
                 当前
@@ -389,7 +396,8 @@ export default function TradingPanel({
                 e.stopPropagation();
                 onToggleHidden(a.name);
               }}
-              className="rounded p-0.5 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)]"
+              className="flex h-7 w-7 items-center justify-center rounded p-0.5 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)] lg:h-auto lg:w-auto"
+              aria-label={`${isHidden ? '恢复显示' : '隐藏'}账户 ${a.displayName || displayBridgeAccount(a.name)}`}
               title={isHidden ? '恢复显示该账户' : '隐藏该账户(移到列表底部,交易下拉框不再显示)'}
             >
               {isHidden ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
@@ -397,7 +405,7 @@ export default function TradingPanel({
           </span>
         </div>
         {hasFin ? (
-          <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+          <div className="grid grid-cols-2 gap-x-3 gap-y-1 break-words text-[11px] [overflow-wrap:anywhere]">
             <span className="text-[var(--tv-muted)]">净清算</span>
             <span className="text-right font-mono">{fmtMoney(a.netLiquidation)}</span>
             <span className="text-[var(--tv-muted)]">现金</span>
@@ -413,7 +421,7 @@ export default function TradingPanel({
           </div>
         ) : (
           <div className="text-[11px] text-[var(--tv-muted)]">
-            余额/盈亏需要升级桥端(NT8 里 F5 编译 TvBridgeAddOn)后可见
+            当前数据桥未提供余额或盈亏，请检查账户连接与桥接版本。
           </div>
         )}
       </div>
@@ -425,7 +433,8 @@ export default function TradingPanel({
     <button
       key={g.connection}
       onClick={() => toggleGroup(g.connection)}
-      className="flex w-full items-center gap-1 rounded px-1 py-1 text-[11px] font-semibold text-[var(--tv-muted)] transition-colors hover:text-[var(--tv-text)]"
+      className="flex min-h-7 w-full items-center gap-1 rounded px-1 py-1 text-[11px] font-semibold text-[var(--tv-muted)] transition-colors hover:text-[var(--tv-text)] lg:min-h-0"
+      aria-expanded={!collapsed.includes(g.connection)}
       title={collapsed.includes(g.connection) ? '展开该组' : '收起该组'}
     >
       {collapsed.includes(g.connection) ? (
@@ -442,10 +451,10 @@ export default function TradingPanel({
     <div className="flex h-full min-h-0 flex-col gap-px overflow-hidden bg-[var(--tv-border)] text-[var(--tv-text)]">
       {/* 持仓/订单轮询失败提示由两个面板共用。 */}
       {pollError && (showTradingPanel || showAccountPanel) && (
-        <div className="mx-2 mt-2 shrink-0 rounded border border-[#ef5350]/40 bg-[#ef5350]/10 px-2 py-1.5 text-[11px] leading-4 text-[#ef5350]">
-          持仓/订单读取失败:{pollError}
+        <div className="mx-2 mt-2 shrink-0 break-words rounded border border-[#ef5350]/40 bg-[#ef5350]/10 px-2 py-1.5 text-[11px] leading-4 text-[#ef5350]">
+          账户同步提示：{pollError}
           <br />
-          可打开 <a className="underline" href={`${getBridgeUrl()}/api/debug`} target="_blank" rel="noreferrer">数据桥诊断</a> 自查桥端状态
+          可打开 <a className="underline" href={`${getBridgeUrl(parseBridgeAccount(account).provider)}/api/debug`} target="_blank" rel="noreferrer">数据桥诊断</a> 自查桥端状态
         </div>
       )}
 
@@ -455,32 +464,34 @@ export default function TradingPanel({
         aria-labelledby="trading-panel-heading"
         className={`${showTradingPanel ? 'flex' : 'hidden'} min-h-0 min-w-0 flex-1 flex-col bg-[var(--tv-panel)]`}
       >
-        <div className="flex h-9 shrink-0 items-center justify-between border-b border-[var(--tv-border)] px-3">
-          <h2 id="trading-panel-heading" className="text-xs font-semibold">交易面板</h2>
+        <div className="flex h-7 shrink-0 items-center justify-between border-b border-[var(--tv-border)] px-2 lg:h-9 lg:px-3">
+          <h2 id="trading-panel-heading" className="text-[11px] font-semibold lg:text-xs">交易面板</h2>
           {onCloseTradingPanel && (
             <button
               type="button"
               onClick={onCloseTradingPanel}
               aria-label="关闭交易面板"
               title="关闭交易面板"
-              className="rounded p-1 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)]"
+              className="flex h-6 w-6 items-center justify-center rounded p-1 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)] lg:h-auto lg:w-auto"
             >
-              <X className="h-3.5 w-3.5" />
+              <X className="h-3 w-3 lg:h-3.5 lg:w-3.5" />
             </button>
           )}
         </div>
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
       {/* 账户 */}
-      <div className="border-b border-[var(--tv-border)] p-3">
+      <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-1.5 border-b border-[var(--tv-border)] px-2 py-1 lg:block lg:gap-x-2 lg:p-3">
         <div className={labelCls}>账户</div>
         {/* 自绘下拉:shadcn Select 不支持分组折叠 */}
-        <div className="relative mt-1" ref={ddRef}>
+        <div className="relative lg:mt-1" ref={ddRef}>
           <button
             onClick={() => setDdOpen((v) => !v)}
-            className="flex h-8 w-full items-center justify-between rounded-md border border-[var(--tv-border)] bg-[var(--tv-bg)] px-2 text-xs"
+            aria-label="选择交易账户"
+            aria-expanded={ddOpen}
+            className="flex h-[26px] w-full items-center justify-between rounded-md border border-[var(--tv-border)] bg-[var(--tv-bg)] px-1.5 text-[11px] lg:h-8 lg:px-2 lg:text-xs"
           >
             <span className="truncate font-mono">
-              {account || '选择账户'}
+              {account ? currentAccount?.displayName || displayBridgeAccount(account) : '选择账户'}
               {account && currentAccount?.connection ? (
                 <span className="ml-1 text-[var(--tv-muted)]">· {currentAccount.connection}</span>
               ) : null}
@@ -490,7 +501,7 @@ export default function TradingPanel({
             />
           </button>
           {ddOpen && (
-            <div className="absolute z-50 mt-1 max-h-72 w-full overflow-y-auto rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)] shadow-lg">
+            <div className="absolute z-50 mt-1 max-h-72 w-full overflow-y-auto overscroll-contain rounded-md border border-[var(--tv-border)] bg-[var(--tv-panel)] shadow-lg">
               {groupByConnection(visibleAccounts).map((g) => (
                 <div key={g.connection}>
                   {renderGroupHeader(g)}
@@ -502,11 +513,11 @@ export default function TradingPanel({
                           onAccountChange(a.name);
                           setDdOpen(false);
                         }}
-                        className={`block w-full px-3 py-1.5 text-left font-mono text-xs transition-colors hover:bg-[#2962ff]/10 ${
+                        className={`block min-h-6 w-full break-words px-2 py-1 text-left font-mono text-[11px] transition-colors [overflow-wrap:anywhere] hover:bg-[#2962ff]/10 lg:min-h-0 lg:px-3 lg:py-1.5 lg:text-xs ${
                           a.name === account ? 'bg-[#2962ff]/15 text-[#2962ff]' : ''
                         }`}
                       >
-                        {a.name}
+                        {a.displayName || displayBridgeAccount(a.name)}
                       </button>
                     ))}
                 </div>
@@ -519,7 +530,7 @@ export default function TradingPanel({
         </div>
         {/* 当前账户财务:净值 / 今日已实现 / 浮盈(3 秒轮询刷新) */}
         {currentAccount && (
-          <div className="mt-2 grid grid-cols-3 gap-1 rounded bg-[var(--tv-bg)] px-2 py-1.5">
+          <div className="mt-2 hidden grid-cols-3 gap-1 rounded bg-[var(--tv-bg)] px-2 py-1.5 lg:grid">
             <div className="min-w-0">
               <div className={labelCls}>净值</div>
               <div className="truncate font-mono text-xs" title={fmtMoney(currentAccount.netLiquidation)}>
@@ -549,12 +560,13 @@ export default function TradingPanel({
       </div>
 
       {/* 下单票 */}
-      <div className="border-b border-[var(--tv-border)] p-3">
+      <div className="border-b border-[var(--tv-border)] p-1.5 lg:p-3">
+        <div className="grid grid-cols-2 items-start gap-x-1.5 lg:block lg:gap-x-2">
         {/* 交易/草稿模式切换 */}
-        <div className="mb-2 grid grid-cols-2 gap-1 rounded bg-[var(--tv-bg)] p-0.5 text-xs">
+        <div className="mb-1 grid grid-cols-2 gap-1 rounded bg-[var(--tv-bg)] text-[11px] lg:mb-2 lg:p-0.5 lg:text-xs">
           <button
             onClick={() => onModeChange('trade')}
-            className={`rounded py-1 font-semibold transition-colors ${
+            className={`min-h-6 rounded py-0.5 font-semibold transition-colors lg:min-h-0 lg:py-1 ${
               mode === 'trade' ? 'bg-[#2962ff] text-white' : 'text-[var(--tv-muted)] hover:text-[var(--tv-text)]'
             }`}
           >
@@ -562,24 +574,24 @@ export default function TradingPanel({
           </button>
           <button
             onClick={() => onModeChange('draft')}
-            className={`rounded py-1 font-semibold transition-colors ${
+            className={`min-h-6 rounded py-0.5 font-semibold transition-colors lg:min-h-0 lg:py-1 ${
               mode === 'draft' ? 'bg-[#f0b90b] text-black' : 'text-[var(--tv-muted)] hover:text-[var(--tv-text)]'
             }`}
           >
             草稿
           </button>
         </div>
-        <div className="mb-2 flex items-center justify-between">
-          <span className="text-xs font-semibold">
+        <div className="col-span-2 row-start-2 mb-1 flex items-center justify-between lg:mb-2">
+          <span className="min-w-0 break-words text-[11px] font-semibold [overflow-wrap:anywhere] lg:text-xs">
             {mode === 'draft' ? '草稿单' : '下单'} · {symbol || '—'}
           </span>
         </div>
 
         {/* MKT / LMT·STP 切换(原买卖切换位) */}
-        <div className="grid grid-cols-2 gap-2">
+        <div className="col-start-2 row-start-1 grid grid-cols-2 gap-1 lg:gap-2">
           <button
             onClick={() => onKindChange('MKT')}
-            className={`rounded py-2 text-sm font-bold transition-colors ${
+            className={`min-h-6 rounded py-0.5 text-[11px] font-bold transition-colors lg:min-h-0 lg:py-2 lg:text-sm ${
               kind === 'MKT'
                 ? 'bg-[#2962ff] text-white'
                 : 'bg-[#2962ff]/15 text-[#2962ff] hover:bg-[#2962ff]/25'
@@ -589,7 +601,7 @@ export default function TradingPanel({
           </button>
           <button
             onClick={() => onKindChange('LMTSTP')}
-            className={`rounded py-2 text-sm font-bold transition-colors ${
+            className={`min-h-6 rounded py-0.5 text-[11px] font-bold transition-colors lg:min-h-0 lg:py-2 lg:text-sm ${
               kind === 'LMTSTP'
                 ? 'bg-[#2962ff] text-white'
                 : 'bg-[#2962ff]/15 text-[#2962ff] hover:bg-[#2962ff]/25'
@@ -598,12 +610,15 @@ export default function TradingPanel({
             LMT/STP
           </button>
         </div>
+        </div>
 
-        <div className="mt-2 grid grid-cols-2 gap-2">
+        <div className="mt-1 grid grid-cols-2 gap-1 lg:mt-2 lg:gap-2">
           <div>
             <div className={labelCls}>数量</div>
             <Input
               type="number"
+              inputMode="numeric"
+              aria-label="数量"
               min={1}
               value={qty}
               onChange={(e) => onQtyChange(Math.max(1, parseInt(e.target.value, 10) || 1))}
@@ -616,6 +631,8 @@ export default function TradingPanel({
                 {mode === 'draft' ? '入场价(图上虚线可拖)' : '价格'}
               </div>
               <Input
+                inputMode="decimal"
+                aria-label={mode === 'draft' ? '入场价' : '价格'}
                 value={limitPrice}
                 onChange={(e) => onLimitPriceChange(e.target.value)}
                 placeholder="0.00"
@@ -628,7 +645,7 @@ export default function TradingPanel({
         {/* LMT/STP 自动判定提示:草稿模式按当前预览方向给出具体结果,交易模式给通用规则 */}
         {kind === 'LMTSTP' &&
           (mode === 'draft' && detected ? (
-            <div className="mt-1 text-[11px] text-[var(--tv-muted)]">
+            <div className="mt-1 text-[10px] leading-[14px] text-[var(--tv-muted)] lg:text-[11px] lg:leading-normal">
               {side === 'BUY' ? '买入' : '卖出'}价
               {detected === 'LIMIT'
                 ? '位于市价' + (side === 'BUY' ? '下方' : '上方')
@@ -639,7 +656,7 @@ export default function TradingPanel({
               </span>
             </div>
           ) : (
-            <div className="mt-1 text-[11px] text-[var(--tv-muted)]">
+            <div className="mt-1 text-[10px] leading-[14px] text-[var(--tv-muted)] lg:text-[11px] lg:leading-normal">
               自动判定:买入价低于市价→限价单 LMT,高于市价→止损单 STP;卖出相反
             </div>
           ))}
@@ -647,11 +664,13 @@ export default function TradingPanel({
         {mode === 'draft' ? (
           <>
             {/* 草稿:止盈/止损金额,自动换算成图上虚线 */}
-            <div className="mt-2 grid grid-cols-2 gap-2">
+            <div className="mt-1 grid grid-cols-2 gap-1 lg:mt-2 lg:gap-2">
               <div>
                 <div className={labelCls}>止盈金额($)</div>
                 <Input
                   type="number"
+                  inputMode="decimal"
+                  aria-label="止盈金额（USD）"
                   min={0}
                   value={tpAmount}
                   onChange={(e) => onTpAmountChange(e.target.value)}
@@ -663,6 +682,8 @@ export default function TradingPanel({
                 <div className={labelCls}>止损金额($)</div>
                 <Input
                   type="number"
+                  inputMode="decimal"
+                  aria-label="止损金额（USD）"
                   min={0}
                   value={slAmount}
                   onChange={(e) => onSlAmountChange(e.target.value)}
@@ -671,7 +692,7 @@ export default function TradingPanel({
                 />
               </div>
             </div>
-            <div className="mt-1.5 flex items-center justify-between text-[11px] text-[var(--tv-muted)]">
+            <div className="mt-1 flex flex-wrap items-center justify-between gap-x-1.5 text-[10px] leading-[14px] text-[var(--tv-muted)] lg:mt-1.5 lg:gap-x-2 lg:text-[11px] lg:leading-normal">
               <span>
                 基准价{' '}
                 <span className="font-mono text-[var(--tv-text)]">
@@ -680,7 +701,7 @@ export default function TradingPanel({
                 {kind === 'MKT' && (
                   <button
                     onClick={onRefreshRef}
-                    className="ml-1.5 text-[#2962ff] hover:underline"
+                    className="ml-1 min-h-6 min-w-6 text-[#2962ff] hover:underline lg:ml-1.5 lg:min-h-0 lg:min-w-0"
                     title="以最新价重新计算虚线位置"
                   >
                     刷新
@@ -690,7 +711,7 @@ export default function TradingPanel({
               <span>每tick ${(tickSize * pointValue).toFixed(2)}</span>
             </div>
             {(tpComputed != null || slComputed != null) && (
-              <div className="mt-1 font-mono text-[11px] leading-4">
+              <div className="mt-1 font-mono text-[10px] leading-[14px] lg:text-[11px] lg:leading-4">
                 {tpComputed != null && (
                   <span className="text-[#26a69a]">TP {tpComputed.toFixed(decimals)}</span>
                 )}
@@ -703,10 +724,12 @@ export default function TradingPanel({
             )}
           </>
         ) : (
-          <div className="mt-2 grid grid-cols-2 gap-2">
+          <div className="mt-1 grid grid-cols-2 gap-1 lg:mt-2 lg:gap-2">
             <div>
               <div className={labelCls}>止盈价(可选)</div>
               <Input
+                inputMode="decimal"
+                aria-label="止盈价（可选）"
                 value={tpPrice}
                 onChange={(e) => setTpPrice(e.target.value)}
                 placeholder="成交后自动挂"
@@ -716,6 +739,8 @@ export default function TradingPanel({
             <div>
               <div className={labelCls}>止损价(可选)</div>
               <Input
+                inputMode="decimal"
+                aria-label="止损价（可选）"
                 value={slPrice}
                 onChange={(e) => setSlPrice(e.target.value)}
                 placeholder="成交后自动挂"
@@ -726,26 +751,26 @@ export default function TradingPanel({
         )}
 
         {/* 提交:买入 +N / 卖出 -N(草稿模式下点击异向按钮先切预览方向,再点提交) */}
-        <div className="mt-3 grid grid-cols-2 gap-2">
+        <div className="mt-1 grid grid-cols-2 gap-1 lg:mt-3 lg:gap-2">
           <Button
             disabled={!enabled || busy || !account || !symbol}
             onClick={() => void submit('BUY')}
-            className={
+            className={`h-7 px-2 py-0 text-[11px] leading-4 lg:h-9 lg:px-4 lg:py-2 lg:text-sm lg:leading-5 ${
               mode === 'draft' && side !== 'BUY'
                 ? 'bg-[#26a69a]/15 text-[#26a69a] hover:bg-[#26a69a]/25'
                 : 'bg-[#26a69a] hover:bg-[#26a69a]/90'
-            }
+            }`}
           >
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : `买入 +${qty}`}
           </Button>
           <Button
             disabled={!enabled || busy || !account || !symbol}
             onClick={() => void submit('SELL')}
-            className={
+            className={`h-7 px-2 py-0 text-[11px] leading-4 lg:h-9 lg:px-4 lg:py-2 lg:text-sm lg:leading-5 ${
               mode === 'draft' && side !== 'SELL'
                 ? 'bg-[#ef5350]/15 text-[#ef5350] hover:bg-[#ef5350]/25'
                 : 'bg-[#ef5350] hover:bg-[#ef5350]/90'
-            }
+            }`}
           >
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : `卖出 -${qty}`}
           </Button>
@@ -753,7 +778,7 @@ export default function TradingPanel({
 
         {message && (
           <div
-            className={`mt-2 flex items-center gap-1.5 text-xs ${
+            className={`mt-1 flex items-center gap-1 text-[10px] leading-[14px] lg:mt-2 lg:gap-1.5 lg:text-xs lg:leading-4 ${
               message.ok ? 'text-[#26a69a]' : 'text-[#ef5350]'
             }`}
           >
@@ -766,28 +791,28 @@ export default function TradingPanel({
           </div>
         )}
         {!enabled && (
-          <div className="mt-2 text-[11px] text-[var(--tv-muted)]">
-            模拟数据模式下不可交易,请连接 NT8 数据桥。
+          <div className="mt-1 text-[10px] leading-[14px] text-[var(--tv-muted)] lg:mt-2 lg:text-[11px] lg:leading-normal">
+            当前账户或行情尚未就绪。请连接所属数据桥，并选择该账户对应的图表行情源。
           </div>
         )}
       </div>
 
       {/* 持仓 */}
-      <div className="border-b border-[var(--tv-border)] p-3">
-        <div className="mb-1.5 text-xs font-semibold">所有持仓</div>
+      <div className="border-b border-[var(--tv-border)] p-1.5 lg:p-3">
+        <div className="mb-1 text-[11px] font-semibold lg:mb-1.5 lg:text-xs">所有持仓</div>
         {openPositions.length === 0 ? (
-          <div className="text-[11px] text-[var(--tv-muted)]">无持仓</div>
+          <div className="text-[10px] text-[var(--tv-muted)] lg:text-[11px]">无持仓</div>
         ) : <div className="space-y-1">
           {openPositions.map(position => {
             const action = rowActions[rowKey('position', position.instrument)];
             return <div key={position.instrument} data-position-instrument={position.instrument}
-              className="rounded bg-[var(--tv-bg)] px-2 py-1.5 text-xs">
+              className="rounded bg-[var(--tv-bg)] px-1.5 py-1 text-[11px] lg:px-2 lg:py-1.5 lg:text-xs">
               <div className="flex items-center justify-between gap-2">
                 <span className="min-w-0 truncate font-mono font-semibold" title={position.instrument}>{position.instrument}</span>
                 <Button size="sm" variant="ghost" disabled={!enabled || !account || action?.busy}
                   aria-label={`市价平仓 ${position.instrument}`}
                   onClick={() => void closePosition(position.instrument)}
-                  className="h-6 shrink-0 px-2 text-[11px] text-[#f0b90b] hover:bg-[var(--tv-border)]">
+                  className="h-6 shrink-0 px-1.5 text-[10px] text-[#f0b90b] hover:bg-[var(--tv-border)] lg:px-2 lg:text-[11px]">
                   {action?.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : '市价平仓'}
                 </Button>
               </div>
@@ -798,20 +823,20 @@ export default function TradingPanel({
                 <span className="font-mono text-[var(--tv-text)]">均价 {formatRowPrice(position.averagePrice)}</span>
               </div>
               {action?.text && <div role={action.ok ? 'status' : 'alert'}
-                className={`mt-1 text-[11px] ${action.ok ? 'text-[#26a69a]' : 'text-[#ef5350]'}`}>{action.text}</div>}
+                className={`mt-1 text-[10px] lg:text-[11px] ${action.ok ? 'text-[#26a69a]' : 'text-[#ef5350]'}`}>{action.text}</div>}
             </div>;
           })}
         </div>}
       </div>
 
       {/* 工作中订单 */}
-      <div className="flex-1 p-3">
-        <div className="mb-1.5 text-xs font-semibold">
+      <div className="flex-1 p-1.5 lg:p-3">
+        <div className="mb-1 text-[11px] font-semibold lg:mb-1.5 lg:text-xs">
           所有工作中订单<span className="ml-1 font-normal text-[var(--tv-muted)]">({workingOrders.length})</span>
         </div>
         <div className="space-y-1">
           {workingOrders.length === 0 && (
-            <div className="text-[11px] text-[var(--tv-muted)]">无</div>
+            <div className="text-[10px] text-[var(--tv-muted)] lg:text-[11px]">无</div>
           )}
           {workingOrders.map((o) => {
             const isBuy = o.action.startsWith('Buy');
@@ -823,14 +848,14 @@ export default function TradingPanel({
               <div
                 key={o.orderId}
                 data-order-id={o.orderId}
-                className="rounded bg-[var(--tv-bg)] px-2 py-1.5 text-xs"
+                className="rounded bg-[var(--tv-bg)] px-1.5 py-1 text-[11px] lg:px-2 lg:py-1.5 lg:text-xs"
               >
                 <div className="mb-1 flex items-center justify-between gap-2">
                   <span className="min-w-0 truncate font-mono font-semibold" title={o.instrument}>{o.instrument}</span>
                   <button
                     onClick={() => void cancelOrder(o.orderId)} disabled={!enabled || !account || action?.busy}
                     aria-label={`撤销 ${o.instrument} 订单 ${o.orderId}`}
-                    className="shrink-0 rounded p-0.5 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[#ef5350] disabled:opacity-40"
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded p-0.5 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[#ef5350] disabled:opacity-40 lg:h-auto lg:w-auto"
                     title="撤单">
                     {action?.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <X className="h-3.5 w-3.5" />}
                   </button>
@@ -844,12 +869,12 @@ export default function TradingPanel({
                 <span className="font-mono">{price > 0 ? `@ ${formatRowPrice(price)}` : '市价'}</span>
                 </div>
                 {action?.text && <div role={action.ok ? 'status' : 'alert'}
-                  className={`mt-1 text-[11px] ${action.ok ? 'text-[#26a69a]' : 'text-[#ef5350]'}`}>{action.text}</div>}
+                  className={`mt-1 text-[10px] lg:text-[11px] ${action.ok ? 'text-[#26a69a]' : 'text-[#ef5350]'}`}>{action.text}</div>}
               </div>
             );
           })}
         </div>
-        <div className="mt-3 text-[11px] leading-4 text-[var(--tv-muted)]">
+        <div className="mt-1.5 text-[10px] leading-[14px] text-[var(--tv-muted)] lg:mt-3 lg:text-[11px] lg:leading-4">
           提示:图表上的订单线可直接拖拽改价(止盈止损线同样可拖);选中线后按 Delete
           键或右键删除即可撤单。
         </div>
@@ -862,7 +887,7 @@ export default function TradingPanel({
         aria-labelledby="account-panel-heading"
         className={`${showAccountPanel ? 'flex' : 'hidden'} min-h-0 min-w-0 flex-1 flex-col bg-[var(--tv-panel)]`}
       >
-        <div className="flex h-9 shrink-0 items-center justify-between border-b border-[var(--tv-border)] px-3">
+        <div className="flex h-8 shrink-0 items-center justify-between border-b border-[var(--tv-border)] px-2 lg:h-9 lg:px-3">
           <h2 id="account-panel-heading" className="text-xs font-semibold">账户信息</h2>
           {onCloseAccountPanel && (
             <button
@@ -870,16 +895,16 @@ export default function TradingPanel({
               onClick={onCloseAccountPanel}
               aria-label="关闭账户信息"
               title="关闭账户信息"
-              className="rounded p-1 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)]"
+              className="flex h-7 w-7 items-center justify-center rounded p-1 text-[var(--tv-muted)] hover:bg-[var(--tv-border)] hover:text-[var(--tv-text)] lg:h-auto lg:w-auto"
             >
               <X className="h-3.5 w-3.5" />
             </button>
           )}
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-2 lg:p-3">
           {accounts.length === 0 && (
             <div className="text-[11px] text-[var(--tv-muted)]">
-              无账户数据(需连接 NT8 数据桥)
+              无账户数据（需连接 NT8 或 ATAS X 数据桥）
             </div>
           )}
           <div className="space-y-2">

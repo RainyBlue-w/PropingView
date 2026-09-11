@@ -1,3 +1,4 @@
+import { bridgeStorageKey, type BridgeProvider } from '@/lib/config';
 import { useCallback, useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
 import TvAdvancedChart from '@/components/TvAdvancedChart';
 import { useOrderLines } from '@/hooks/useOrderLines';
@@ -15,8 +16,10 @@ const WORKSPACE_KEY = 'nt8-terminal-chart-workspace';
 type PaneInfo = { symbol: string; interval: string };
 export interface ChartWorkspaceHandle { saveLayouts: () => Promise<void> }
 interface Props {
+  provider?: BridgeProvider;
   ref?: Ref<ChartWorkspaceHandle>;
   count: 1 | 2 | 4;
+  singleChart?: boolean;
   datafeed: TvDatafeed;
   symbol: string;
   initialInterval: string;
@@ -35,9 +38,9 @@ interface Props {
   onActiveWidget: (widget: TradingViewWidget) => void;
 }
 
-function readWorkspace(): { active: number; panes: PaneInfo[] } {
+function readWorkspace(storageKey: string): { active: number; panes: PaneInfo[] } {
   try {
-    const value = JSON.parse(localStorage.getItem(WORKSPACE_KEY) || '{}');
+    const value = JSON.parse(localStorage.getItem(storageKey) || '{}');
     return {
       active: Number.isInteger(value.active) && value.active >= 0 && value.active < 4 ? value.active : 0,
       panes: Array.isArray(value.panes) ? value.panes.slice(0, 4).map((p: Partial<PaneInfo> | null) => ({
@@ -50,12 +53,16 @@ function readWorkspace(): { active: number; panes: PaneInfo[] } {
 
 /** Each pane owns its drawings and chart events; selecting a pane only routes the order ticket. */
 export default function ChartWorkspace({ ref, ...props }: Props) {
-  const { count, replay, symbol, initialInterval, symbols, onActiveWidget } = props;
-  const [saved] = useState(() => replay ? { active: 0, panes: [] as PaneInfo[] } : readWorkspace());
+  const { count, singleChart = false, replay, symbol, initialInterval, symbols, onActiveWidget } = props;
+  const storageKey = bridgeStorageKey(WORKSPACE_KEY, props.provider || 'nt8');
+  const [saved] = useState(() => replay ? { active: 0, panes: [] as PaneInfo[] } : readWorkspace(storageKey));
   const [active, setActive] = useState(saved.active < count ? saved.active : 0);
-  const [mountedCount, setMountedCount] = useState(count);
-  // Retain already opened charts when reducing the grid so unsaved drawings and subscriptions survive.
-  if (count > mountedCount) setMountedCount(count);
+  const [mountedIndices, setMountedIndices] = useState(() => singleChart ? [active] : Array.from({ length: count }, (_, index) => index));
+  // Phone entry mounts only the selected chart; already opened widgets survive viewport and grid changes.
+  const requiredIndices = singleChart ? [active < count ? active : 0] : Array.from({ length: count }, (_, index) => index);
+  if (requiredIndices.some(index => !mountedIndices.includes(index))) {
+    setMountedIndices(current => [...new Set([...current, ...requiredIndices])].sort((a, b) => a - b));
+  }
   if (active >= count) setActive(0);
   const [panes, setPanes] = useState<PaneInfo[]>(() => {
     const candidates = [symbol, ...symbols.map(s => s.symbol).filter(s => s !== symbol)];
@@ -92,14 +99,15 @@ export default function ChartWorkspace({ ref, ...props }: Props) {
   }, [active, readyVersion, onActiveWidget]);
   useEffect(() => {
     if (!replay) {
-      try { localStorage.setItem(WORKSPACE_KEY, JSON.stringify({ active, panes })); } catch { /* Preferences are optional. */ }
+      try { localStorage.setItem(storageKey, JSON.stringify({ active, panes })); } catch { /* Preferences are optional. */ }
     }
-  }, [active, panes, replay]);
+  }, [active, panes, replay, storageKey]);
 
-  return <div data-chart-workspace data-chart-count={count} className={`grid h-full min-h-0 min-w-0 gap-px bg-[var(--tv-border)] ${count === 1 ? 'grid-cols-1 grid-rows-1' : count === 2 ? 'grid-cols-2 grid-rows-1' : 'grid-cols-2 grid-rows-2'}`}>
-    {initialPanes.slice(0, mountedCount).map((info, index) => <ChartPane
-      key={index} {...props} index={index} info={info} active={index === active} visible={index < count}
-      multiple={count > 1} onSelect={setActive} onRegister={register} onInfo={recordPane}
+  const visibleCount = singleChart ? 1 : count;
+  return <div data-chart-workspace data-chart-count={visibleCount} className={`grid h-full min-h-0 min-w-0 gap-px bg-[var(--tv-border)] ${visibleCount === 1 ? 'grid-cols-1 grid-rows-1' : visibleCount === 2 ? 'grid-cols-2 grid-rows-1' : 'grid-cols-2 grid-rows-2'}`}>
+    {mountedIndices.map(index => <ChartPane
+      key={index} {...props} index={index} info={initialPanes[index]} active={index === active} visible={singleChart ? index === active : index < count}
+      multiple={visibleCount > 1} onSelect={setActive} onRegister={register} onInfo={recordPane}
     />)}
   </div>;
 }
@@ -111,6 +119,7 @@ function ChartPane({ index, info, active, visible, multiple, onSelect, onRegiste
   onInfo: (index: number, info: PaneInfo) => void;
 }) {
   const { datafeed, theme, replay, symbols, account, tradingEnabled, orders, positions, brackets, qty, showTradeHistory, tradeSig, onChanged } = props;
+  const layoutScope = props.provider === 'atas' ? `atas-chart-${index + 1}` : index ? `chart-${index + 1}` : undefined;
   const [widget, setWidget] = useState<TradingViewWidget | null>(null);
   const [current, setCurrent] = useState(info);
   const [epoch, setEpoch] = useState(0);
@@ -143,7 +152,7 @@ function ChartPane({ index, info, active, visible, multiple, onSelect, onRegiste
       };
       sync();
       try {
-        if (!initialized && !chart.getAllStudies?.().length && !hasSavedLayout(index ? `chart-${index + 1}` : undefined)) {
+        if (!initialized && !chart.getAllStudies?.().length && !hasSavedLayout(layoutScope)) {
           void chart.createStudy?.('Moving Average Exponential', false, false, { length: 20 });
         }
       } catch { /* An unavailable study or stored layout must not prevent chart use. */ }
@@ -166,7 +175,7 @@ function ChartPane({ index, info, active, visible, multiple, onSelect, onRegiste
       frameDocument?.removeEventListener('focusin', activate, true);
       onRegister(index, null);
     };
-  }, [widget, index, onInfo, onRegister, onSelect]);
+  }, [widget, index, onInfo, onRegister, onSelect, layoutScope]);
 
   useEffect(() => () => { widgetRef.current = null; }, []);
   useEffect(() => {
@@ -177,9 +186,10 @@ function ChartPane({ index, info, active, visible, multiple, onSelect, onRegiste
   const pointValue = resolvePointValue(current.symbol, instrument?.pointValue);
   const getLastPrice = useCallback(() => datafeed.getLastPrice(current.symbol), [datafeed, current.symbol]);
   const subscribePrice = useCallback((fn: (symbol: string, price: number) => void) => datafeed.onPriceChange(fn), [datafeed]);
-  useOrderLines({ widget, symbol: current.symbol, account, orders, positions, brackets, tickSize, pointValue,
+  useOrderLines({ widget, symbol: current.symbol, account: tradingEnabled ? account : '', orders: tradingEnabled ? orders : [],
+    positions: tradingEnabled ? positions : [], brackets: tradingEnabled ? brackets : [], tickSize, pointValue,
     getLastPrice, subscribePrice, theme, epoch, onChanged });
-  usePendingBracketLines({ widget, symbol: current.symbol, account, orders, brackets, pointValue, epoch });
+  usePendingBracketLines({ widget, symbol: current.symbol, account: tradingEnabled ? account : '', orders: tradingEnabled ? orders : [], brackets: tradingEnabled ? brackets : [], pointValue, epoch });
   useExecutionTrades({ widget, symbol: current.symbol, account: tradingEnabled ? account : '', pointValue,
     refreshKey: tradeSig, enabled: showTradeHistory && visible, epoch });
 
@@ -221,6 +231,6 @@ function ChartPane({ index, info, active, visible, multiple, onSelect, onRegiste
       <span className="truncate">{index + 1} · {current.symbol}</span><span className="shrink-0">{active ? '当前交易图表' : '点击选择'}</span>
     </button>}
     <div className="min-h-0 flex-1"><TvAdvancedChart datafeed={datafeed} symbol={info.symbol} initialInterval={info.interval}
-      theme={theme} persistLayout={!replay} layoutScope={index ? `chart-${index + 1}` : undefined} onWidgetReady={onReady} /></div>
+      theme={theme} persistLayout={!replay} layoutScope={layoutScope} onWidgetReady={onReady} /></div>
   </div>;
 }

@@ -1,9 +1,12 @@
-import { getBridgeUrl } from './config';
+import { bridgeProviderName, getBridgeUrl, type BridgeProvider } from './config';
+import { bridgeAccountId, parseBridgeAccount } from './bridgeAccounts';
 
 /** NT8 交易接口客户端(对应 TvBridgeAddOn 的交易端点) */
 
 export interface Nt8Account {
   name: string;
+  displayName?: string;
+  provider?: BridgeProvider;
   connection?: string;
   /** 以下财务字段依赖桥端升级(F5);旧版桥不返回,前端显 — */
   currency?: string;
@@ -63,6 +66,7 @@ export interface Nt8Execution {
   instrument?: string;
   commission?: number;
   account?: string;
+  accountDisplayName?: string;
   pointValue?: number;
   currency?: string;
 }
@@ -104,11 +108,11 @@ export interface PlaceOrderPayload {
   slAmount?: number;
 }
 
-async function request<T>(path: string, init?: RequestInit, timeoutMs = 10000): Promise<T> {
+async function request<T>(provider: BridgeProvider, path: string, init?: RequestInit, timeoutMs = 10000): Promise<T> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const resp = await fetch(`${getBridgeUrl()}${path}`, { ...init, signal: ctrl.signal });
+    const resp = await fetch(`${getBridgeUrl(provider)}${path}`, { ...init, signal: ctrl.signal });
     const data = (await resp.json()) as T & { error?: string };
     if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
     return data;
@@ -117,54 +121,90 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs = 10000): 
   }
 }
 
-function post<T>(path: string, payload: unknown): Promise<T> {
-  return request<T>(path, {
+function post<T>(provider: BridgeProvider, path: string, payload: unknown): Promise<T> {
+  return request<T>(provider, path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
 }
 
-export const nt8Trading = {
-  getAccounts: () => request<{ accounts: Nt8Account[] }>('/api/accounts'),
+/** Raw bridge protocol. The server only sees its original account names. */
+export function bridgeTrading(provider: BridgeProvider) { return {
+  getAccounts: () => request<{ accounts: Nt8Account[] }>(provider, '/api/accounts', undefined, 2500),
 
   getPositions: (account: string) =>
-    request<{ positions: Nt8Position[] }>(
+    request<{ positions: Nt8Position[] }>(provider,
       `/api/positions?account=${encodeURIComponent(account)}`,
     ),
 
   getOrders: (account: string) =>
-    request<{ orders: Nt8Order[] }>(
+    request<{ orders: Nt8Order[] }>(provider,
       `/api/orders?account=${encodeURIComponent(account)}`,
     ),
 
   getBrackets: (account: string) =>
-    request<{ brackets: Nt8Bracket[]; syncError?: string }>(
+    request<{ brackets: Nt8Bracket[]; syncError?: string }>(provider,
       `/api/brackets?account=${encodeURIComponent(account)}`,
     ),
 
   getExecutions: (account: string, symbol: string, from: number, to: number) =>
-    request<{ executions: Nt8Execution[] }>(
+    request<{ executions: Nt8Execution[] }>(provider,
       `/api/executions?account=${encodeURIComponent(account)}&symbol=${encodeURIComponent(symbol)}&from=${from}&to=${to}`,
     ),
 
   getExecutionPage: (account: string, symbol: string, from: number, to: number, offset = 0, limit = 100) =>
-    request<ExecutionPage>(
+    request<ExecutionPage>(provider,
       `/api/executions?account=${encodeURIComponent(account)}&symbol=${encodeURIComponent(symbol)}&from=${from}&to=${to}&offset=${offset}&limit=${limit}`,
     ),
 
   placeOrder: (payload: PlaceOrderPayload) =>
-    post<{ ok: boolean; orderId: string }>('/api/order/place', payload),
+    post<{ ok: boolean; orderId: string }>(provider, '/api/order/place', payload),
 
   cancelOrder: (account: string, orderId: string) =>
-    post<{ ok: boolean }>('/api/order/cancel', { account, orderId }),
+    post<{ ok: boolean }>(provider, '/api/order/cancel', { account, orderId }),
 
   changeOrder: (
     account: string,
     orderId: string,
     price: { limitPrice?: number; stopPrice?: number },
-  ) => post<{ ok: boolean }>('/api/order/change', { account, orderId, ...price }),
+  ) => post<{ ok: boolean }>(provider, '/api/order/change', { account, orderId, ...price }),
 
   closePosition: (account: string, symbol: string) =>
-    post<{ ok: boolean }>('/api/position/close', { account, symbol }),
+    post<{ ok: boolean }>(provider, '/api/position/close', { account, symbol }),
+}; }
+
+export const BRIDGE_PROVIDERS: BridgeProvider[] = ['nt8', 'atas'];
+export function namespaceExecution(provider: BridgeProvider, row: Nt8Execution, fallbackAccount = ''): Nt8Execution {
+  return { ...row, account: bridgeAccountId(provider, row.account || fallbackAccount || '未知账户') };
+}
+
+/** Accounts from both bridges coexist; every account-scoped operation routes by its immutable ID. */
+export const nt8Trading = {
+  async getAccounts(): Promise<{ accounts: Nt8Account[]; errors?: string[] }> {
+    const results = await Promise.allSettled(BRIDGE_PROVIDERS.map(async provider => {
+      const result = await bridgeTrading(provider).getAccounts();
+      return result.accounts.map(account => ({ ...account, name: bridgeAccountId(provider, account.name), displayName: account.displayName || account.name, provider,
+        connection: `${bridgeProviderName(provider)} · ${account.connection || '本地账户'}` }));
+    }));
+    return { accounts: results.flatMap(result => result.status === 'fulfilled' ? result.value : []),
+      errors: results.flatMap((result, index) => result.status === 'rejected' ? [`${bridgeProviderName(BRIDGE_PROVIDERS[index])}：${String(result.reason)}`] : []) };
+  },
+  getPositions(account: string) { const id = parseBridgeAccount(account); return bridgeTrading(id.provider).getPositions(id.name); },
+  getOrders(account: string) { const id = parseBridgeAccount(account); return bridgeTrading(id.provider).getOrders(id.name); },
+  getBrackets(account: string) { const id = parseBridgeAccount(account); return bridgeTrading(id.provider).getBrackets(id.name); },
+  async getExecutions(account: string, symbol: string, from: number, to: number) {
+    const id = parseBridgeAccount(account);
+    const result = await bridgeTrading(id.provider).getExecutions(id.name, symbol, from, to);
+    return { executions: result.executions.map(row => namespaceExecution(id.provider, row, id.name)) };
+  },
+  async getExecutionPage(account: string, symbol: string, from: number, to: number, offset = 0, limit = 100) {
+    const id = parseBridgeAccount(account);
+    const result = await bridgeTrading(id.provider).getExecutionPage(id.name, symbol, from, to, offset, limit);
+    return { ...result, executions: result.executions.map(row => namespaceExecution(id.provider, row, id.name)) };
+  },
+  placeOrder(payload: PlaceOrderPayload) { const id = parseBridgeAccount(payload.account); return bridgeTrading(id.provider).placeOrder({ ...payload, account: id.name }); },
+  cancelOrder(account: string, orderId: string) { const id = parseBridgeAccount(account); return bridgeTrading(id.provider).cancelOrder(id.name, orderId); },
+  changeOrder(account: string, orderId: string, price: { limitPrice?: number; stopPrice?: number }) { const id = parseBridgeAccount(account); return bridgeTrading(id.provider).changeOrder(id.name, orderId, price); },
+  closePosition(account: string, symbol: string) { const id = parseBridgeAccount(account); return bridgeTrading(id.provider).closePosition(id.name, symbol); },
 };

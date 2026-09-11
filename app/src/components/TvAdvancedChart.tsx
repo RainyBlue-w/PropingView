@@ -195,11 +195,8 @@ export default function TvAdvancedChart({
     });
 
     onWidgetReadyRef.current?.(widget);
-    try {
-      if (layoutScope === undefined) (window as unknown as Record<string, unknown>).__lastWidget = widget;
-    } catch {
-      /* ignore */
-    }
+    // ChartTerminal exposes the selected widget. A newly mounted background
+    // chart must not overwrite it when a phone's single chart expands on desktop.
 
     return () => {
       // 回放进出会重建 widget，旧布局定时器不能再访问已移除的 iframe API。

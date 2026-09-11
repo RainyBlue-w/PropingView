@@ -6,10 +6,10 @@ import ts from '../app/node_modules/typescript/lib/typescript.js';
 
 const out = path.resolve('.tmp-webbridge/trade-history-filters');
 fs.mkdirSync(out, { recursive: true });
-for (const name of ['tradeAnalytics', 'tradeHistoryFilters']) {
+for (const name of ['config', 'bridgeAccounts', 'tradeAnalytics', 'tradeHistoryFilters']) {
   const source = fs.readFileSync(`app/src/lib/${name}.ts`, 'utf8');
   const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText
-    .replace("from './tradeAnalytics'", "from './tradeAnalytics.mjs'");
+    .replace(/from '(\.\/.+?)'/g, "from '$1.mjs'");
   fs.writeFileSync(path.join(out, `${name}.mjs`), js);
 }
 const storage = new Map();
@@ -123,10 +123,10 @@ test('account metadata retains disconnected accounts and publishes only actual c
 const restored = await import(`${moduleUrl.href}?reload`);
 test('fresh module restores persisted connections for offline archived records', () => {
   const remembered = restored.getTradeAccountGroups();
-  assert.equal(remembered.get('A'), 'Broker Two');
-  assert.equal(remembered.get('Local'), '本地账户');
-  const rows = [make('old', '2026-09-09T00:00:00')];
-  assert.equal(filterTradeHistory(rows, { ...empty, group: 'Broker Two' }, remembered).rows.length, 1);
+  assert.equal(remembered.get('bridge:nt8:A'), 'NT8 · Broker Two');
+  assert.equal(remembered.get('bridge:nt8:Local'), 'NT8 · 本地账户');
+  const rows = [make('old', '2026-09-09T00:00:00', { account: 'bridge:nt8:A' })];
+  assert.equal(filterTradeHistory(rows, { ...empty, group: 'NT8 · Broker Two' }, remembered).rows.length, 1);
 });
 
 test('storage failures leave current-session filters functional', () => {
@@ -140,7 +140,7 @@ test('storage failures leave current-session filters functional', () => {
 storage.set('nt8-terminal-history-account-groups-v1', JSON.stringify([null, ['broken'], ['Valid', 'Connection'], [42, 'bad'], ['__proto__', 'Safe name']]));
 const malformed = await import(`${moduleUrl.href}?malformed`);
 test('invalid cached entries are ignored without losing valid accounts', () => {
-  assert.deepEqual([...malformed.getTradeAccountGroups()], [['Valid', 'Connection'], ['__proto__', 'Safe name']]);
+  assert.deepEqual([...malformed.getTradeAccountGroups()], [['bridge:nt8:Valid', 'NT8 · Connection'], ['bridge:nt8:__proto__', 'NT8 · Safe name']]);
 });
 
 console.log(`Passed ${passed} trade history filter scenarios.`);

@@ -3,7 +3,7 @@ import { ChartNoAxesCombined, ChevronDown, ChevronUp, Clock3, Play, Plus, Rotate
 import { Button } from '@/components/ui/button';
 import { AlertDialog, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
 import TradeHistory from '@/components/TradeHistory';
-import type { FeedAdapter } from '@/types/market';
+import { bridgeProviderName, type BridgeProvider } from '@/lib/config';
 import type { NewReplaySessionInput, ReplaySession } from '@/lib/replayStore';
 
 export interface ReplayDashboardProps {
@@ -14,7 +14,7 @@ export interface ReplayDashboardProps {
   defaultSymbol?: string;
   symbols?: string[];
   storageError?: string;
-  adapter?: FeedAdapter;
+  provider?: BridgeProvider;
 }
 
 function localDateTime(time: number): string {
@@ -43,7 +43,7 @@ const pnlColor = (value: number | null) => value === null || value === 0
   ? 'text-[var(--tv-text)]' : value > 0 ? 'text-[#26a69a]' : 'text-[#ef5350]';
 
 export default function ReplayDashboard({
-  sessions, onCreate, onResume, onDelete, defaultSymbol = '', symbols = [], storageError, adapter,
+  sessions, onCreate, onResume, onDelete, defaultSymbol = '', symbols = [], storageError, provider = 'nt8',
 }: ReplayDashboardProps) {
   const [name, setName] = useState(() => `回放 ${new Date().toLocaleDateString()}`);
   const [symbolDraft, setSymbolDraft] = useState<string | null>(null);
@@ -114,7 +114,7 @@ export default function ReplayDashboard({
         <header className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h1 className="flex items-center gap-2 text-xl font-semibold"><RotateCcw className="h-5 w-5 text-[#2962ff]" />回放模拟</h1>
-            <p className="mt-1 text-sm text-[var(--tv-muted)]">创建独立模拟会话，保存进度，回顾每次练习的交易表现。</p>
+            <p className="mt-1 text-sm text-[var(--tv-muted)]">两桥会话统一保存；继续回放和查看记录时，使用会话原来的行情源。</p>
           </div>
           <span className="rounded-full border border-[var(--tv-border)] px-3 py-1 text-xs text-[var(--tv-muted)]">{sessions.length} 个会话 · 本机保存</span>
         </header>
@@ -127,7 +127,7 @@ export default function ReplayDashboard({
         )}
 
         <section className="rounded-xl border border-[var(--tv-border)] bg-[var(--tv-panel)] p-4 md:p-5" aria-label="新建回放会话">
-          <h2 className="mb-4 flex items-center gap-2 text-sm font-semibold"><Plus className="h-4 w-4" />新建会话</h2>
+          <h2 className="mb-4 flex items-center gap-2 text-sm font-semibold"><Plus className="h-4 w-4" />新建会话 · {bridgeProviderName(provider)}</h2>
           <form onSubmit={submit} className="grid items-end gap-4 md:grid-cols-2 xl:grid-cols-[1fr_1fr_1.2fr_1fr_auto]">
             <label className="space-y-1.5 text-xs text-[var(--tv-muted)]"><span>会话名称</span>
               <input aria-label="会话名称" required maxLength={100} value={name} onChange={event => setName(event.target.value)} className={inputClass} />
@@ -164,7 +164,7 @@ export default function ReplayDashboard({
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <h3 className="truncate font-semibold" title={session.name}>{session.name}</h3>
-                        <p className="mt-1 text-xs text-[var(--tv-muted)]">{session.symbol} · {session.state.executions.length} 笔成交</p>
+                        <p className="mt-1 text-xs text-[var(--tv-muted)]">{bridgeProviderName(session.provider ?? 'nt8')} · {session.symbol} · {session.state.executions.length} 笔成交</p>
                       </div>
                       <div className="flex shrink-0 items-center gap-1">
                         <ChartNoAxesCombined className="h-5 w-5 text-[#2962ff]" />
@@ -205,7 +205,7 @@ export default function ReplayDashboard({
               <div><h2 className="font-semibold">{selected.name}</h2><p className="mt-1 text-xs text-[var(--tv-muted)]">开始于 {new Date(selected.startTime * 1000).toLocaleString()} · 初始资金 {money(selected.initialEquity)}</p></div>
               <Button size="sm" variant="ghost" onClick={() => setSelectedId(null)} className="text-[var(--tv-muted)]">收起</Button>
             </div>
-            <TradeHistory key={selected.id} rows={selected.state.executions} title="会话交易记录" showFilters adapter={adapter} toTime={selected.cursor} />
+            <TradeHistory key={selected.id} rows={selected.state.executions} title="会话交易记录" showFilters historyProvider={selected.provider ?? 'nt8'} toTime={selected.cursor} />
           </section>
         )}
       </div>

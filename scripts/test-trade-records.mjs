@@ -6,7 +6,7 @@ import ts from '../app/node_modules/typescript/lib/typescript.js';
 
 const out = path.resolve('.tmp-webbridge/trade-records');
 fs.mkdirSync(out, { recursive: true });
-for (const name of ['tradeAnalytics', 'tradeHistoryFilters', 'tradeRecords']) {
+for (const name of ['config', 'bridgeAccounts', 'tradeAnalytics', 'tradeHistoryFilters', 'tradeRecords']) {
   const source = fs.readFileSync(`app/src/lib/${name}.ts`, 'utf8');
   const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText
     .replace(/from '(\.\/\w+)'/g, "from '$1.mjs'");

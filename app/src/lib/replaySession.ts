@@ -68,6 +68,8 @@ export class ReplaySession implements FeedAdapter {
     this.cursor = startTime;
   }
 
+  get exchange(): string | undefined { return this.inner.exchange; }
+
   getCursor(): number {
     return this.cursor;
   }

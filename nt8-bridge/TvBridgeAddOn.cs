@@ -305,7 +305,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     switch (path)
                     {
                         case "/api/status":  HandleStatus(ns);   break;
-                        case "/api/symbols": HandleSymbols(ns);  break;
+                        case "/api/symbols": HandleSymbols(ns, q);  break;
                         case "/api/resolve": HandleResolve(ns, q); break;
                         case "/api/history": HandleHistory(ns, q); break;
                         // ---- 交易接口 ----
@@ -424,6 +424,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 + "\"connected\":" + (connected ? "true" : "false") + ","
                 + "\"connectionName\":" + JsonQuote(connName) + ","
                 + "\"historyWindowVersion\":1,"
+                + "\"symbolCatalogVersion\":2,"
                 + "\"executionArchiveVersion\":1,\"archive\":" + ExecutionArchiveStatusJson() + ","
                 + "\"time\":" + ToUnix(DateTime.Now).ToString(CultureInfo.InvariantCulture)
                 + "}";
@@ -431,19 +432,20 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         // 候选合约列表:直接读 NT8 合约库(Instrument.All),不用预设字符串。
-        // 跳过已到期合约,按全名排序;前端图表/订单/持仓统一以 NT8 FullName 为准
-        private void HandleSymbols(NetworkStream ns)
+        // 跳过历史月份期货,按全名排序;前端图表/订单/持仓统一以 NT8 FullName 为准
+        private void HandleSymbols(NetworkStream ns, Dictionary<string, string> q = null)
         {
+            bool currentOnly = IsCurrentContractSearch(q);
             Instrument[] all;
-            lock (Instrument.All) all = Instrument.All.ToArray();
+            if (currentOnly) all = GetCurrentContractCatalog(DateTime.Now);
+            else { lock (Instrument.All) all = Instrument.All.ToArray(); }
             var names = new List<string>();
             foreach (var instr in all)
             {
                 if (instr == null || instr.MasterInstrument == null) continue;
                 try
                 {
-                    // 已到期合约不下发(股票等无到期日的 Expiry 为 MinDate,不受影响)
-                    if (instr.Expiry > Core.Globals.MinDate && instr.Expiry < DateTime.Now) continue;
+                    if (!currentOnly && IsPastFuturesContractMonth(instr, DateTime.Now)) continue;
                 }
                 catch { }
                 names.Add(instr.FullName);
@@ -462,8 +464,67 @@ namespace NinjaTrader.NinjaScript.AddOns
                 first = false;
                 sb.Append(entry);
             }
-            sb.Append("]}");
+            sb.Append(currentOnly ? "],\"currentOnly\":true,\"symbolCatalogVersion\":2}" : "]}");
             WriteJson(ns, 200, sb.ToString());
+        }
+
+        private static bool IsCurrentContractSearch(Dictionary<string, string> q)
+        {
+            string value;
+            return q != null && q.TryGetValue("currentOnly", out value)
+                && (value == "1" || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static Instrument[] GetCurrentContractCatalog(DateTime now)
+        {
+            var result = new Dictionary<string, Instrument>(StringComparer.OrdinalIgnoreCase);
+            Instrument[] instruments;
+            lock (Instrument.All) instruments = Instrument.All.ToArray();
+            foreach (var instr in instruments)
+                if (instr != null && instr.MasterInstrument != null
+                    && instr.MasterInstrument.InstrumentType != InstrumentType.Future)
+                    result[instr.FullName] = instr;
+
+            MasterInstrument[] masters;
+            lock (MasterInstrument.All) masters = MasterInstrument.All.ToArray();
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var master in masters)
+            {
+                if (master == null || string.IsNullOrWhiteSpace(master.Name)
+                    || master.InstrumentType != InstrumentType.Future || !visited.Add(master.Name)) continue;
+                var current = GetCurrentContract(master, now);
+                if (current != null) result[current.FullName] = current;
+            }
+            return result.Values.OrderBy(i => i.FullName, StringComparer.OrdinalIgnoreCase).ToArray();
+        }
+
+        private static Instrument GetCurrentContract(MasterInstrument master, DateTime now)
+        {
+            try
+            {
+                if (master == null || master.InstrumentType != InstrumentType.Future) return null;
+                DateTime month;
+                lock (master.RolloverCollection) month = master.GetNextExpiry(now);
+                if (month <= Core.Globals.MinDate || month >= Core.Globals.MaxDate) return null;
+                // Follow NT8's configured rollover schedule. Do not infer the lead month
+                // from calendar proximity or select a different expiry by its name.
+                var current = Instrument.GetInstrument(master.Name + " " + month.ToString("MM-yy", CultureInfo.InvariantCulture));
+                if (current == null || current.MasterInstrument == null
+                    || !string.Equals(current.MasterInstrument.Name, master.Name, StringComparison.OrdinalIgnoreCase)
+                    || current.MasterInstrument.InstrumentType != InstrumentType.Future
+                    || current.Expiry.Year != month.Year || current.Expiry.Month != month.Month) return null;
+                return current;
+            }
+            catch { return null; }
+        }
+
+        private static bool IsPastFuturesContractMonth(Instrument instr, DateTime now)
+        {
+            // NT8 Expiry 表示期货合约月份,不是最后交易日;如 09-26 的值可为 9 月 1 日。
+            // 保留整个当月,避免月初就把仍可查看/交易的当月合约从候选列表删除。
+            if (instr.MasterInstrument.InstrumentType != InstrumentType.Future) return false;
+            DateTime expiry = instr.Expiry;
+            return expiry > Core.Globals.MinDate && expiry < new DateTime(now.Year, now.Month, 1);
         }
 
         // 按名称解析任意 NT8 合约,供前端搜索框直接输入的合约使用
@@ -476,12 +537,22 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             Instrument instr = null;
             try { instr = Instrument.GetInstrument(symbol); } catch { }
-            string entry = BuildSymbolJson(instr);
+            bool currentOnly = IsCurrentContractSearch(q);
+            if (currentOnly && instr != null && instr.MasterInstrument != null
+                && instr.MasterInstrument.InstrumentType == InstrumentType.Future)
+            {
+                var current = GetCurrentContract(instr.MasterInstrument, DateTime.Now);
+                bool rootOnly = string.Equals(symbol.Trim(), instr.MasterInstrument.Name, StringComparison.OrdinalIgnoreCase);
+                if (current == null || (!rootOnly && !string.Equals(instr.FullName, current.FullName, StringComparison.OrdinalIgnoreCase)))
+                { WriteJson(ns, 404, "{\"error\":\"not the current NT8 contract\"}"); return; }
+                instr = current;
+            }
+            string entry = BuildSymbolJson(instr, currentOnly);
             if (entry == null) { WriteJson(ns, 404, "{\"error\":\"unknown symbol\"}"); return; }
             WriteJson(ns, 200, entry);
         }
 
-        private static string BuildSymbolJson(Instrument instr)
+        private static string BuildSymbolJson(Instrument instr, bool currentOnly = false)
         {
             if (instr == null) return null;
 
@@ -504,6 +575,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                  + ",\"tickSize\":" + tick.ToString("R", CultureInfo.InvariantCulture)
                  + ",\"pointValue\":" + pointValue.ToString("R", CultureInfo.InvariantCulture)
                  + ",\"type\":" + JsonQuote(type)
+                 + (currentOnly ? ",\"currentOnly\":true" : string.Empty)
                  + "}";
         }
 

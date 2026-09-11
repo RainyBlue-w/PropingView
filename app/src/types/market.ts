@@ -11,6 +11,7 @@ export interface Bar {
 export interface SymbolInfo {
   symbol: string;
   name: string;
+  exchange?: string;
   /** 最小跳动,如 ES=0.25;缺省按 0.01 */
   tickSize?: number;
   /** 每 1.00 点的美元价值,如 ES=50;桥未返回时前端按品种兜底 */
@@ -24,7 +25,10 @@ export interface SymbolInfo {
  * 对下分别由 NT8 数据桥(REST+SSE)或本地模拟数据实现。
  */
 export interface FeedAdapter {
+  exchange?: string;
   getSymbols(): Promise<SymbolInfo[]>;
+  /** 搜索候选目录；可限制为主力合约，普通图表及历史解析仍使用 getSymbols。 */
+  getSearchSymbols?(): Promise<SymbolInfo[]>;
   /** from/to 为 Unix 秒 */
   getHistory(
     symbol: string,
@@ -38,6 +42,8 @@ export interface FeedAdapter {
     intervalSec: number,
     onBar: (bar: Bar) => void,
   ): () => void;
-  /** 可选:按名称解析不在列表里的合约(用户在图表搜索框直接输入时触发) */
+  /** 按原生名称精确解析，包括已保存图表和历史交易的旧合约。 */
   resolve?(symbol: string): Promise<SymbolInfo | null>;
+  /** 搜索栏的名称解析，使用与搜索候选目录相同的限制。 */
+  searchResolve?(symbol: string): Promise<SymbolInfo | null>;
 }

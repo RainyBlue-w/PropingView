@@ -6,10 +6,10 @@ import ts from '../app/node_modules/typescript/lib/typescript.js';
 
 const output = path.resolve('.tmp-webbridge/datafeed-isolation-unit');
 fs.mkdirSync(output, { recursive: true });
-for (const name of ['tvDatafeed', 'simTrading']) {
+for (const name of ['symbolSearch', 'tvDatafeed', 'simTrading']) {
   const source = fs.readFileSync(`app/src/lib/${name}.ts`, 'utf8');
   const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
-  fs.writeFileSync(path.join(output, `${name}.mjs`), compiled);
+  fs.writeFileSync(path.join(output, `${name}.mjs`), compiled.replace(/from '(.\/.+?)'/g, "from '$1.mjs'"));
 }
 const { TvDatafeed } = await import(pathToFileURL(path.join(output, 'tvDatafeed.mjs')));
 const { SimTrading, SIM_ACCOUNT } = await import(pathToFileURL(path.join(output, 'simTrading.mjs')));
