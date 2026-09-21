@@ -1,88 +1,98 @@
-# NT8 行情终端 — 本地部署 TradingView + NinjaTrader 8 数据对接
+# NT8 数据与交易桥
 
-## 主力合约搜索
+本目录的 [TvBridgeAddOn.cs](TvBridgeAddOn.cs) 是单文件 NinjaTrader 8 AddOn，复用 NT8 已有连接，提供行情、账户、交易、桥管理的止盈止损及本机成交归档。随 AddOn 加载启动，在终止时停止，默认仅监听 `127.0.0.1:8090`。
 
-网页的 NT8 搜索每个期货品种只显示 NT8 换月规则选定的当前月份，使用原生 `MasterInstrument.GetNextExpiry(DateTime.Now)`，不是按成交量另算主力。每次重开搜索更新结果；股票、外汇等非期货维持原列表。
+项目全貌见 [项目架构与发布流程](../项目架构与发布流程.md)，构建和回归入口见 [开发与验证](../docs/开发与验证.md)。前端当前使用 Charting Library v32.1.0；前端启动、ATAS 和复制后台不由本文件管理。
 
-搜索请求使用 `/api/symbols?currentOnly=true` 和 `/api/resolve?symbol=...&currentOnly=true`，非当前期货月份不会作为搜索结果返回。普通合约解析、已打开图表、历史交易详情及持仓仍保留原生月份，不自动换仓。ATAS 搜索不受影响。
+## 安装与更新
 
-复制新版 `TvBridgeAddOn.cs` 后，在 NT8 NinjaScript Editor 按 **F5 编译并重启 NT8**；`/api/status.symbolCatalogVersion` 为 `2` 表示已加载新版。旧桥会在搜索栏提示升级。
+1. 将 `TvBridgeAddOn.cs` 复制到 NT8 用户目录的 `bin\Custom\AddOns\TvBridgeAddOn.cs`。通常为 `文档\NinjaTrader 8\bin\Custom\AddOns\`，以实际 NT8 用户目录为准。
+2. 打开 NT8 控制中心 → **New → NinjaScript Editor**，按 **F5 / Compile** 编译。
+3. 通过本机 `http://127.0.0.1:8090/api/status` 核对已加载能力。若仍是旧能力，在合适时机重启 NT8 再检查；仅刷新网页不会更新 AddOn。
 
-## 架构
+当前源码能力标识：
 
+| 字段 | 值 | 说明 |
+|---|---|---|
+| `historyWindowVersion` | `1` | 历史请求按完整交易日扩窗，再裁回请求范围 |
+| `symbolCatalogVersion` | `2` | NT8 平台当前合约搜索 |
+| `copySnapshotVersion` | `1` | 复制交易所需严格账户快照 |
+| `executionArchiveVersion` | `1` | 独立于平台内存的磁盘成交归档 |
+
+源码存在、编译成功和已加载新版是三件事，以运行桥的能力响应为准。桥使用 TCP 回环监听，无需为桥端口配置 HTTP.sys URL 预留。
+
+远程手机或电脑访问网页服务器，其 `/api/*` 同源代理再连接本机 NT8 桥。不要把远程浏览器的 `127.0.0.1` 当成 NT8 主机，也无需将桥改为对外监听。网页服务器和 NT8 应在同一主机；远程入口配置见开发文档。
+
+## 合约搜索与原生标识
+
+网页搜索使用 `/api/symbols?currentOnly=true` 和 `/api/resolve?symbol=...&currentOnly=true`。每个期货品种只返回 `MasterInstrument.GetNextExpiry(DateTime.Now)` 按 NT8 换月设置选定的当前月份；不另按市场成交量计算主力，不自动猜测缺失月份。非期货保留原目录。
+
+不带 `currentOnly` 的目录枚举 NT8 合约库，不再使用预设 Watchlist；期货仅过滤早于当月的月份，不能用到期月的第一天与当前时间比较而提前剔除当月。普通精确解析、已打开图表、持仓和历史详情不受搜索限制，不自动换月或换仓。
+
+所有行情和交易请求保留桥返回的 NT8 `Instrument.FullName`。检索可以接受月份别名，实际选中与提交仍使用原生完整名称，不能在交易路径强制转换为固定 `MM-YY` 格式。ATAS 合约显示关联由其独立桥负责，不套用到 NT8 交易标识。
+
+## API
+
+桥内所有路径以 `/api` 开头。账户和合约参数使用原始标识并进行 URL 编码；写操作使用 JSON 请求体。
+
+| 端点 | 方法 | 内容 |
+|---|---|---|
+| `/api/status` | GET | 连接、能力版本及 `archive` 归档状态 |
+| `/api/debug` | GET | 各账户连接状态、持仓 / 订单计数及读取异常 |
+| `/api/symbols` | GET | 原生合约目录；可加 `currentOnly=true` |
+| `/api/resolve?symbol=...` | GET | 精确合约解析、最小跳动、点值；搜索另加 `currentOnly=true` |
+| `/api/history?symbol=...&interval=60&from=...&to=...` | GET | OHLCV 历史；周期和 Unix 时间均为秒 |
+| `/api/stream?symbol=...&interval=60` | SSE | 实时更新，`data:` 帧及连接保活 |
+| `/api/accounts` | GET | 活跃 / 内置账户、连接组及财务数据；账户币种可能为 UsDollar，由前端规范显示为 USD |
+| `/api/positions?account=...` | GET | 该账户所有合约的非空仓持仓，含带符号数量和均价；事件缓存兜底 |
+| `/api/orders?account=...` | GET | 工作订单及近 6 小时订单，按时间倒序最多 60 条；界面按状态筛选 |
+| `/api/brackets?account=...` | GET | 本桥登记的入场与 TP/SL 信息，供未成交保护价预览，及账户 `syncError` |
+| `/api/executions` | GET | 本机成交归档；可选 `account/symbol/from/to/offset/limit` |
+| `/api/order/place` | POST | 市价、限价、止损、止损限价；可带保护价格或市价单保护金额 |
+| `/api/order/cancel` | POST | 按账户及订单 ID 撤单 |
+| `/api/order/change` | POST | 按账户及订单 ID 改价 |
+| `/api/position/close` | POST | 按账户及完整合约撤工作单并反向市价平仓 |
+
+桥管理的保护单在入场实际成交后生成，随同账户同合约持仓数量同步；不接管任意外部手工或 ATM 保护单。下单、撤改、平仓接口会操作真实账户，不属于只读健康检查。
+
+## 复制交易严格快照
+
+复制引擎使用以下查询，不把普通界面的有限订单列表当成完整账户状态：
+
+```text
+GET /api/positions?account=...&copyStrict=true
+GET /api/orders?account=...&copyStrict=true
 ```
-┌──────────────────────────────┐        ┌─────────────────────────────┐
-│  浏览器:本地 TradingView 终端  │        │  NinjaTrader 8               │
-│  (Charting Library v29.4)    │  HTTP  │  TvBridgeAddOn (本仓库 C#)   │
-│  app/  (React + Vite)        │ ─────► │  http://127.0.0.1:8090       │
-│                              │ ◄───── │   ├─ /api/status   状态      │
-│  历史K线 REST                 │  JSON  │   ├─ /api/symbols  合约表    │
-│  实时K线 SSE 推送             │        │   ├─ /api/history  历史K线   │
-└──────────────────────────────┘        │   └─ /api/stream   实时推送  │
-                                        │      (NT8 当前数据源:Kinetick/  │
-                                        │       Continuum/IB/模拟…)     │
-                                        └─────────────────────────────┘
+
+响应带 `copyStrict:true`。严格订单返回全部非终态订单，不截断 60 条；严格持仓仍保留 NT8 懒加载所需的事件缓存兜底，但集合读取失败、原生数量与缓存冲突时返回 503，不伪装空仓。未支持该能力的旧桥不能启用复制交易。
+
+复制实际执行在 [copy-trading](../copy-trading/README.md) 独立后台。它跟随新成交并发送目标市价单，不提前复制未成交挂单。
+
+## 成交持久化
+
+归档路径：
+
+```text
+NinjaTrader.Core.Globals.UserDataDir/TvBridge/executions-v1.log
 ```
 
-- 前端用的是 TradingView 官方 **Charting Library v29.4**(你已放入 `charting_library-master`),全功能高级图表:画线、指标、多周期、回放等都在。
-- 数据通过自定义 **JS API datafeed** 接入:历史 K 线走 REST,实时 K 线走 SSE(服务器推送事件)。
-- NT8 未启动时自动降级为**模拟数据**,界面随时可打开。
+以 `/api/status` 或 `/api/executions` 中 `archive.path` 为准。日志独立于浏览器和 NT8 当前内存成交集合；桥启动 / 扫描补入仍可取得的成交，并持续记录账户成交事件。账户与 ExecutionId 去重，迟到资料或手续费更新追加新版本；保留毫秒时间、文本编码和行校验，写入后落盘。
 
-## 一、启动前端终端
+分页返回 `executions/total/nextOffset/archive`，最多每页 500 条；不分页时兼容最近 200 条升序图表标记查询，不限制磁盘归档总量。`timeMs` 是精确成交毫秒，`time` 为秒。浏览器 IndexedDB 是查询缓存，不能替代此文件备份。
 
-```bash
-cd app
-npm install        # 首次
-npm run dev        # 开发模式,默认 3000 端口
-# 或
-npm run build && npm run preview   # 生产模式
-```
+归档只能保存启用后取得的成交；NT8 已丢失且此前未归档的历史不能自动恢复。读取、校验、待写入异常应查看 `archive`，不能把缓存可见等同于磁盘已保存。
 
-打开浏览器访问终端页面即可。右上角悬浮面板显示数据源状态:
+## 排障与代码入口
 
-- 绿色 `NT8 已连接` — 正在使用 NinjaTrader 实时数据
-- 黄色 `模拟数据` — 未检测到数据桥,显示内置模拟行情
-- 齿轮图标可修改数据桥地址(默认 `http://127.0.0.1:8090`)
-
-## 二、安装 NT8 数据桥 AddOn
-
-1. 把 `nt8-bridge/TvBridgeAddOn.cs` 复制到:
-   `文档\NinjaTrader 8\bin\Custom\AddOns\TvBridgeAddOn.cs`
-2. 打开 NT8 控制中心 → **New → NinjaScript Editor**,右侧找到 AddOns 下的该文件。
-3. 按 **F5**(或点 Compile)编译。如有报错,把错误信息发给我(不同 NT8 小版本 API 略有差异)。
-4. **重启 NT8**。AddOn 会自动加载并启动数据桥,输出窗口(Output)会有提示:
-   `TvBridgeAddOn: 数据桥已启动 http://127.0.0.1:8090/api/status`
-5. 验证:浏览器直接访问 <http://127.0.0.1:8090/api/status>,应返回 JSON。
-
-> 无需管理员权限:数据桥用的是裸 TCP 监听回环地址,不经过 Windows HTTP.sys,也不需要防火墙放行(纯本机回环通信)。
-
-## 三、配置合约(自选股)
-
-编辑 `TvBridgeAddOn.cs` 顶部的 `Watchlist` 数组,改成你 NT8 里有数据的合约名
-(与 Market Analyzer / 图表里的名称一致,如 `"ES 09-26"`、`"NQ 09-26"`),
-重新编译并重启 NT8。终端左上角的商品搜索框中即可搜到这些合约。
-
-> **换月提醒**:期货合约会到期。图表突然无数据时,先确认 Watchlist 里的
-> 合约月份是否还是当前主力(如 ES 从 `09-26` 换到 `12-26`)。
-> 在图表搜索框直接输入完整合约名(如 `ES 12-26`)可立即使用,
-> 由 `/api/resolve` 动态解析,不用改代码重新编译。
-
-## 四、接口约定(便于二次开发)
-
-| 端点 | 说明 |
+| 症状 | 核对入口 |
 |---|---|
-| `GET /api/status` | `{ connected, connectionName, time }` |
-| `GET /api/symbols` | `{ symbols: [{ symbol, name, tickSize, type }] }`(Watchlist 合约表) |
-| `GET /api/resolve?symbol=ES%2009-26` | 按名解析任意 NT8 合约,不存在返回 404 |
-| `GET /api/history?symbol=ES%2009-25&interval=60&from=…&to=…` | interval 为秒,from/to 为 Unix 秒,返回 `{ bars: [{ time, open, high, low, close, volume }] }` |
-| `GET /api/stream?symbol=…&interval=60` | SSE 流,每条 `data:` 是成型中的当前 K 线 JSON |
+| 网页显示 NT8 未连接 | 主机 `/api/status`，远程网页同源 `/api/status`；确认平台 / AddOn、端口和代理 |
+| 外部账户持仓为空 | `/api/debug` 的连接状态、读取错误、持仓计数；账户订阅与事件缓存不可移除 |
+| 当前月份搜索不到 / 出现过多月份 | `symbolCatalogVersion=2`、`currentOnly` 响应与 NT8 换月规则；不能改回 Watchlist |
+| 复制规则提示更新桥或快照异常 | `copySnapshotVersion=1` 和严格接口；不要用普通快照绕过检查 |
+| 历史有断续或时间错位 | `historyWindowVersion=1`、原平台历史范围、交易时段；检查扩窗、bar 起始时间和 SSE 桶对齐 |
+| 交易记录缺失 | `archive` 状态 / 文件；区分未归档旧记录、磁盘失败和浏览器查询缓存 |
 
-支持周期:任意分钟数(1/2/3/5/10/15/30/60/120/240)、日线、周线。
+单文件内按方法检索：`OnStateChange/StartServer`（生命周期）、`HandleStatus`（能力）、`GetCurrentContractCatalog/HandleResolve`（搜索）、`HandleHistory/BarStartUnix`（历史）、`HandlePositions/HandleOrders`（快照）、`ExecutionJournal`（归档）、`RegisterBracketOnFill`（保护）。
 
-## 五、常见问题
-
-- **时间戳/时区**:K 线时间按本机时区解释(NT8 图表时间即本机时间),前端同样使用浏览器本地时区,两者一致。
-- **历史数据为空**:NT8 的历史数据来自其连接的数据源。先在 NT8 图表里能开出该合约 K 线,数据桥才有数据;必要时在 NT8 的 Historical Data Manager 里下载。
-- **实时不刷新**:确认 NT8 已连接行情源(Control Center 右下角绿色),且该合约在 Market Analyzer 里有跳动。
-- **端口冲突**:8090 被占用时,改 `TvBridgeAddOn.cs` 的 `Port` 常量,并在终端界面齿轮设置里同步修改。
-- **换电脑访问**:数据桥只监听 127.0.0.1,如需局域网访问,请自行评估风险后改为 `IPAddress.Any`。
+离线回归入口包括 `scripts/test-symbol-catalog.ps1 -CompileNative`、`scripts/test-copy-snapshots.ps1` 及成交归档脚本；环境要求与完整命令见 [开发与验证](../docs/开发与验证.md)。文档列出入口不表示本次已执行测试或部署。

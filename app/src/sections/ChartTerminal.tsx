@@ -9,6 +9,7 @@ import BridgeConnectionStatus from '@/components/BridgeConnectionStatus';
 import TradingPanel, { type OrderKind } from '@/sections/TradingPanel';
 import AccountPages from '@/sections/AccountPages';
 import CopyTradingPage from '@/sections/CopyTradingPage';
+import MonitorPageLoader from '@/components/MonitorPageLoader';
 import ReplayBar from '@/sections/ReplayBar';
 import ReplayDashboard from '@/sections/ReplayDashboard';
 import { createReplaySession, deleteReplaySession, loadReplaySessions, saveReplaySession, type ReplaySession as SavedReplaySession, type NewReplaySessionInput } from '@/lib/replayStore';
@@ -73,7 +74,7 @@ export default function ChartTerminal() {
   const quoteSwitchGeneration = useRef(0);
   const initialAccountSource = useRef(false);
   const [bridgeStatuses, setBridgeStatuses] = useState<Partial<Record<BridgeProvider, Nt8Status | null>>>({});
-  const [page, setPage] = useState<'chart' | 'overview' | 'records' | 'replay' | 'copy'>('chart');
+  const [page, setPage] = useState<'chart' | 'monitor' | 'overview' | 'records' | 'replay' | 'copy'>('chart');
   const compact = useMediaQuery('(max-width: 1023px)');
   // 手机在图表下方打开一个紧凑面板；不覆盖桌面双面板的打开状态与宽度偏好。
   const [mobilePanel, setMobilePanel] = useState<'trading' | 'account' | 'replay' | null>(null);
@@ -923,7 +924,7 @@ export default function ChartTerminal() {
       /> : <nav aria-label="主导航" className="flex shrink-0 flex-wrap items-center gap-1 border-b border-[var(--tv-border)] bg-[var(--tv-panel)] px-2 py-1 text-sm text-[var(--tv-text)] lg:h-12 lg:flex-nowrap lg:px-3 lg:py-0">
         <span className="mr-3 hidden 2xl:inline text-xs font-semibold tracking-widest">TRADING TERMINAL</span>
         <div className="flex w-full min-w-0 items-center gap-1 lg:w-auto">
-        {([{ id: 'chart', label: '交易图表' }, { id: 'overview', label: '账户总览' }, { id: 'records', label: '交易记录' }, { id: 'replay', label: '回放模拟' }, { id: 'copy', label: '复制交易' }] as const).map(item =>
+        {([{ id: 'chart', label: '交易图表' }, { id: 'monitor', label: '监控面板' }, { id: 'overview', label: '账户总览' }, { id: 'records', label: '交易记录' }, { id: 'replay', label: '回放模拟' }, { id: 'copy', label: '复制交易' }] as const).map(item =>
           <button key={item.id} aria-current={page === item.id ? 'page' : undefined} onClick={() => void navigate(item.id)}
             className={`whitespace-nowrap rounded-md px-2 py-2 sm:px-4 ${page === item.id ? 'bg-[#2962ff]/15 text-[#5b8cff]' : 'text-[var(--tv-muted)] hover:text-[var(--tv-text)]'}`}>{item.label}</button>)}
         </div>
@@ -1241,6 +1242,7 @@ export default function ChartTerminal() {
       </div>
       </div>
       {page === 'copy' && <div className="absolute inset-0"><CopyTradingPage /></div>}
+      {page === 'monitor' && <div className="absolute inset-0"><MonitorPageLoader /></div>}
       {(page === 'overview' || page === 'records') && <div className="absolute inset-0"><AccountPages
         page={page} accounts={liveAccounts} error={liveAccountsError} enabled={BRIDGE_PROVIDERS.some(source => bridgeStatuses[source]?.connected)} onRefresh={refreshLiveAccounts}
       /></div>}

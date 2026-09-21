@@ -4,9 +4,9 @@ import { Button } from '@/components/ui/button';
 import BridgeConnectionStatus, { type BridgeStatuses } from '@/components/BridgeConnectionStatus';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 
-type Page = 'chart' | 'overview' | 'records' | 'replay' | 'copy';
+type Page = 'chart' | 'monitor' | 'overview' | 'records' | 'replay' | 'copy';
 const pages: { id: Page; label: string }[] = [
-  { id: 'chart', label: '交易图表' }, { id: 'overview', label: '账户总览' },
+  { id: 'chart', label: '交易图表' }, { id: 'monitor', label: '监控面板' }, { id: 'overview', label: '账户总览' },
   { id: 'records', label: '交易记录' }, { id: 'replay', label: '回放模拟' },
   { id: 'copy', label: '复制交易' },
 ];
