@@ -196,8 +196,7 @@ public sealed class AtasMarketService : IDisposable
                 {
                     if (!Connected || instrument.MarketDataSource?.Connector is { IsConnected: false })
                         throw new IOException("ATAS 合约行情连接已断开");
-                    await writer.WriteAsync(": heartbeat\n\n".AsMemory(), token);
-                    await writer.FlushAsync(token);
+                    await WriteStreamFrameAsync(writer, ": heartbeat\n\n", token);
                     continue;
                 }
                 if (!available) break;
@@ -258,10 +257,23 @@ public sealed class AtasMarketService : IDisposable
         return new(new DateTimeOffset(utc).ToUnixTimeSeconds(), candle.OpenPrice, candle.HighPrice, candle.LowPrice, candle.ClosePrice, candle.Volume);
     }
 
-    private static async Task EmitAsync(StreamWriter writer, AtasBar bar, CancellationToken cancellationToken)
+    private static Task EmitAsync(StreamWriter writer, AtasBar bar, CancellationToken cancellationToken)
+        => WriteStreamFrameAsync(writer, "data: " + JsonSerializer.Serialize(bar, Json) + "\n\n", cancellationToken);
+
+    private static async Task WriteStreamFrameAsync(StreamWriter writer, string frame, CancellationToken cancellationToken)
     {
-        await writer.WriteAsync(("data: " + JsonSerializer.Serialize(bar, Json) + "\n\n").AsMemory(), cancellationToken);
-        await writer.FlushAsync(cancellationToken);
+        try
+        {
+            await writer.WriteAsync(frame.AsMemory(), cancellationToken);
+            await writer.FlushAsync(cancellationToken);
+        }
+        catch (Exception ex) when (ex is IOException or System.Net.Sockets.SocketException or ObjectDisposedException)
+        {
+            // Refreshing or switching a chart closes its downstream SSE connection.
+            // End only this subscription through StreamAsync's cancellation path;
+            // history/provider IO failures outside this write boundary still report LastError.
+            throw new OperationCanceledException("网页行情订阅已断开", ex, cancellationToken);
+        }
     }
     private static string Required(IReadOnlyDictionary<string, string> query, string key) => query.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)
         ? value : throw new BridgeRequestException(400, "缺少参数 " + key);

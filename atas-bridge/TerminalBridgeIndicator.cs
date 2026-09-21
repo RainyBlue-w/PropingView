@@ -160,7 +160,7 @@ internal sealed class TerminalBridgeHost : IDisposable
                 connectionName = _trading?.ConnectionName ?? "ATAS X",
                 version = _market?.Version ?? AtasPlatformAccess.RuntimeVersion,
                 supportedVersions = AtasPlatformAccess.SupportedVersions,
-                bridgeVersion = 4,
+                bridgeVersion = 5,
                 chartSymbolVersion = 1,
                 historyWindowVersion = 1,
                 executionArchiveVersion = 1,
